@@ -9,39 +9,69 @@
 namespace powermonitor {
 namespace client {
 
-class ShmPowerRingBuffer {
+class ShmPicoRingBuffer {
 public:
-    ShmPowerRingBuffer()
-        : buffer_(POWER_METRICS_SHM_NAME,
-                  kPowerMetricsVersion,
+    ShmPicoRingBuffer()
+        : buffer_(PICO_METRICS_SHM_NAME,
+                  kPicoMetricsVersion,
                   buffers::ShmOpenMode::create_or_open) {}
 
-    explicit ShmPowerRingBuffer(const char* shm_name)
+    explicit ShmPicoRingBuffer(const char* shm_name)
         : buffer_(shm_name,
-                  kPowerMetricsVersion,
+                  kPicoMetricsVersion,
                   buffers::ShmOpenMode::create_or_open) {}
 
-    void push(const RealtimePowerSample& sample) {
+    void push(const PicoSample& sample) {
         std::lock_guard<std::mutex> lock(producer_mutex_);
         buffer_.push_overwrite(sample);
     }
 
-    uint64_t overflow_count() const {
-        return buffer_.overflow_count();
-    }
-
+    uint64_t overflow_count() const { return buffer_.overflow_count(); }
     bool valid() const { return buffer_.valid(); }
     bool ok() const { return valid(); }
     bool is_creator() const { return buffer_.is_creator(); }
 
 private:
-    using PowerSpscBuffer = buffers::spsc_ring_buffer<
-        RealtimePowerSample,
-        kPowerMetricsRingCapacity,
+    using PicoSpscBuffer = buffers::spsc_ring_buffer<
+        PicoSample,
+        kPicoMetricsRingCapacity,
         buffers::ShmStorage
     >;
 
-    PowerSpscBuffer buffer_;
+    PicoSpscBuffer buffer_;
+    std::mutex producer_mutex_;
+};
+
+class ShmOnboardRingBuffer {
+public:
+    ShmOnboardRingBuffer()
+        : buffer_(ONBOARD_METRICS_SHM_NAME,
+                  kOnboardMetricsVersion,
+                  buffers::ShmOpenMode::create_or_open) {}
+
+    explicit ShmOnboardRingBuffer(const char* shm_name)
+        : buffer_(shm_name,
+                  kOnboardMetricsVersion,
+                  buffers::ShmOpenMode::create_or_open) {}
+
+    void push(const OnboardShmSample& sample) {
+        std::lock_guard<std::mutex> lock(producer_mutex_);
+        buffer_.push_overwrite(sample);
+    }
+
+    uint64_t overflow_count() const { return buffer_.overflow_count(); }
+    bool valid() const { return buffer_.valid(); }
+    bool ok() const { return valid(); }
+    bool is_creator() const { return buffer_.is_creator(); }
+
+private:
+    using OnboardSpscBuffer = buffers::spsc_ring_buffer<
+        OnboardShmSample,
+        kOnboardMetricsRingCapacity,
+        buffers::ShmStorage
+    >;
+
+    OnboardSpscBuffer buffer_;
     std::mutex producer_mutex_;
 };
 

@@ -147,7 +147,8 @@ private:
      std::atomic<bool> streaming_{false};
      std::atomic<bool> save_requested_{false};
      std::atomic<uint64_t> sample_counter_{0};
-     std::atomic<uint64_t> realtime_power_sequence_{0};
+     std::atomic<uint64_t> realtime_pico_sequence_{0};
+     std::atomic<uint64_t> realtime_onboard_sequence_{0};
      uint64_t session_start_unix_us_ = 0;
      uint64_t session_end_unix_us_ = 0;
      uint8_t cmd_seq_ = 0;
@@ -157,7 +158,8 @@ private:
      std::mutex command_mutex_;
      mutable size_t last_stats_width_ = 0;
      UiState ui_state_;
-     ShmPowerRingBuffer power_ring_buffer_;
+     ShmPicoRingBuffer pico_ring_buffer_;
+     ShmOnboardRingBuffer onboard_ring_buffer_;
   };
 
 

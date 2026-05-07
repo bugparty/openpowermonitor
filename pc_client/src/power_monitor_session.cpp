@@ -17,11 +17,14 @@
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <unistd.h>
 #endif
 
 #include <CLI/CLI.hpp>
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/event.hpp>
+#include <ftxui/component/loop.hpp>
 #include <ftxui/component/mouse.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
@@ -1002,37 +1005,34 @@ void PowerMonitorSession::process_onboard_loop() {
 }
 
 void PowerMonitorSession::export_pico_power_sample(const Session::Sample& sample) {
-    if (!power_ring_buffer_.ok()) {
+    if (!pico_ring_buffer_.ok()) {
         return;
     }
 
     const PicoEngineeringValues values = compute_pico_engineering_values(session_->get_config(), sample);
 
-    RealtimePowerSample power_sample{};
-    power_sample.sequence_num = realtime_power_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
-    power_sample.source = static_cast<uint32_t>(PowerSampleSource::kPico);
+    PicoSample power_sample{};
+    power_sample.sequence_num = realtime_pico_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
     power_sample.flags = sample.flags;
     power_sample.host_timestamp_us = sample.host_timestamp_us;
     power_sample.unix_timestamp_us = sample.device_timestamp_unix_us;
     power_sample.device_timestamp_us = sample.device_timestamp_us;
-    power_sample.device_timestamp_unix_us = sample.device_timestamp_unix_us;
     power_sample.power_w = values.power_w;
     power_sample.voltage_v = values.vbus_v;
     power_sample.current_a = values.current_a;
-    power_sample.temp_c = values.temp_c;
+    power_sample.ina228_temp_c = values.temp_c;
     power_sample.energy_j = values.energy_j;
 
-    power_ring_buffer_.push(power_sample);
+    pico_ring_buffer_.push(power_sample);
 }
 
 void PowerMonitorSession::export_onboard_power_sample(const OnboardSample& sample) {
-    if (!power_ring_buffer_.ok()) {
+    if (!onboard_ring_buffer_.ok()) {
         return;
     }
 
-    RealtimePowerSample power_sample{};
-    power_sample.sequence_num = realtime_power_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
-    power_sample.source = static_cast<uint32_t>(PowerSampleSource::kOnboard);
+    OnboardShmSample power_sample{};
+    power_sample.sequence_num = realtime_onboard_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
     power_sample.host_timestamp_us = sample.mono_ns > 0 ? static_cast<uint64_t>(sample.mono_ns / 1000) : 0;
     power_sample.unix_timestamp_us = sample.unix_ns > 0 ? static_cast<uint64_t>(sample.unix_ns / 1000) : 0;
     power_sample.power_w = sample.total_mw / 1000.0;
@@ -1043,10 +1043,18 @@ void PowerMonitorSession::export_onboard_power_sample(const OnboardSample& sampl
     power_sample.cpu_temp_c = sample.temp_cpu_mc > 0 ? (sample.temp_cpu_mc / 1000.0) : 0.0;
     power_sample.gpu_temp_c = sample.temp_gpu_mc > 0 ? (sample.temp_gpu_mc / 1000.0) : 0.0;
 
-    power_ring_buffer_.push(power_sample);
+    onboard_ring_buffer_.push(power_sample);
 }
 
 int PowerMonitorSession::run_tui_loop() {
+#ifndef _WIN32
+    if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+        append_log("Interactive mode requires a TTY");
+        std::cerr << "Interactive mode requires a TTY. Run without -i for headless capture." << std::endl;
+        return 1;
+    }
+#endif
+
     auto sum_counts = [](const std::atomic<uint64_t> counts[256]) {
         uint64_t total = 0;
         for (int i = 0; i < 256; ++i) {
@@ -1056,6 +1064,7 @@ int PowerMonitorSession::run_tui_loop() {
     };
 
     ScreenInteractive screen = ScreenInteractive::TerminalOutput();
+    screen.TrackMouse(false);
 
     auto get_logs = [this]() {
         std::lock_guard<std::mutex> lock(ui_state_.mutex);
@@ -1187,7 +1196,7 @@ int PowerMonitorSession::run_tui_loop() {
                    }()),
                    text(latest),
                    separator(),
-                   text("Keys: [t]=toggle stream  [s]=save snapshot  [q]=quit  Tab=focus logs, PgUp/PgDn/Wheel=scroll") | dim,
+                   text("Keys: [t]=toggle stream  [s]=save snapshot  [q]=quit  Tab=focus logs, PgUp/PgDn=scroll") | dim,
                    separator(),
                    text("Logs (newest first):") | bold,
                });
@@ -1197,9 +1206,8 @@ int PowerMonitorSession::run_tui_loop() {
     Component renderer = Renderer(body, [body] { return body->Render() | border; });
 
     renderer = CatchEvent(renderer, [&](Event event) {
-        if (event == Event::Character('q') || event == Event::Character('Q')) {
+        if (event == Event::Character('q') || event == Event::Character('Q') || event == Event::CtrlC) {
             stop_requested_.store(true);
-            screen.ExitLoopClosure()();
             return true;
         }
         if (event == Event::Character('s') || event == Event::Character('S')) {
@@ -1217,42 +1225,33 @@ int PowerMonitorSession::run_tui_loop() {
         return false;
     });
 
-    std::thread refresher([&] {
-#ifdef _WIN32
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
-#endif
-        while (!stop_requested_.load()) {
-            if (g_signal_interrupted.load()) {
-                stop_requested_.store(true);
-                screen.PostEvent(Event::Character('q'));
-                return;
-            }
+    Loop loop(&screen, renderer);
+    while (!stop_requested_.load() && !loop.HasQuitted()) {
+        if (g_signal_interrupted.load()) {
+            stop_requested_.store(true);
+            break;
+        }
 
-            // Drain STATS_REPORT so UI updates in near real-time
-            protocol::DynamicFrame async_frame;
-            while (response_queue_->pop_by_msgid(async_frame, static_cast<uint8_t>(protocol::MsgId::kStatsReport))) {
+        protocol::DynamicFrame async_frame;
+        while (response_queue_->pop_by_msgid(async_frame, static_cast<uint8_t>(protocol::MsgId::kStatsReport))) {
+            process_async_control_frame(async_frame);
+        }
+
+        constexpr int kMaxControlFramesPerTick = 16;
+        for (int i = 0; i < kMaxControlFramesPerTick && response_queue_->pop_wait(async_frame, 0); ++i) {
+            if (async_frame.type == protocol::FrameType::kEvt &&
+                async_frame.msgid == static_cast<uint8_t>(protocol::MsgId::kTimeSyncRequest) && streaming_.load()) {
+                on_time_sync_request();
+            } else {
                 process_async_control_frame(async_frame);
             }
-
-            // Wait up to 50ms for any frame; wake immediately on device TIME_SYNC_REQUEST
-            if (response_queue_->pop_wait(async_frame, 50)) {
-                if (async_frame.type == protocol::FrameType::kEvt &&
-                    async_frame.msgid == static_cast<uint8_t>(protocol::MsgId::kTimeSyncRequest) && streaming_.load()) {
-                    on_time_sync_request();
-                } else {
-                    process_async_control_frame(async_frame);
-                }
-            }
-
-            screen.PostEvent(Event::Custom);
         }
-        screen.PostEvent(Event::Character('q'));
-    });
 
-    screen.Loop(renderer);
-    if (refresher.joinable()) {
-        refresher.join();
+        screen.RequestAnimationFrame();
+        loop.RunOnce();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+
     return 0;
 }
 

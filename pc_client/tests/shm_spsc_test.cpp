@@ -27,13 +27,28 @@ using namespace powermonitor::client;
 
 namespace {
 
-using PowerSpscBuffer = buffers::spsc_ring_buffer<
-    RealtimePowerSample,
-    kPowerMetricsRingCapacity,
+using PicoSpscBuffer = buffers::spsc_ring_buffer<
+    PicoSample,
+    kPicoMetricsRingCapacity,
+    buffers::ShmStorage
+>;
+using OnboardSpscBuffer = buffers::spsc_ring_buffer<
+    OnboardShmSample,
+    kOnboardMetricsRingCapacity,
     buffers::ShmStorage
 >;
 
-bool pop_sample(PowerSpscBuffer& reader, RealtimePowerSample* sample) {
+bool pop_pico(PicoSpscBuffer& reader, PicoSample* sample) {
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        if (reader.try_pop(*sample)) {
+            return true;
+        }
+        usleep(100);
+    }
+    return false;
+}
+
+bool pop_onboard(OnboardSpscBuffer& reader, OnboardShmSample* sample) {
     for (int attempt = 0; attempt < 100; ++attempt) {
         if (reader.try_pop(*sample)) {
             return true;
@@ -49,7 +64,7 @@ Session::Config realtime_export_config() {
     return config;
 }
 
-Session::Sample pico_sample(uint32_t seq) {
+Session::Sample pico_session_sample(uint32_t seq) {
     Session::Sample sample;
     sample.seq = seq;
     sample.host_timestamp_us = 1000 + seq;
@@ -61,7 +76,7 @@ Session::Sample pico_sample(uint32_t seq) {
     return sample;
 }
 
-OnboardSample onboard_sample(int64_t seq) {
+OnboardSample onboard_session_sample(int64_t seq) {
     OnboardSample sample;
     sample.mono_ns = 1000000 + seq * 1000;
     sample.unix_ns = 2000000 + seq * 1000;
@@ -72,19 +87,18 @@ OnboardSample onboard_sample(int64_t seq) {
 }  // namespace
 
 TEST(ShmPowerSpscTest, CreateAndPush) {
-    const char* test_shm = "/test_power_spsc_basic";
-    shm_unlink(test_shm);  // Clean up if exists
+    const char* test_shm = "/test_pico_spsc_basic";
+    shm_unlink(test_shm);
 
-    ShmPowerRingBuffer buffer(test_shm);
+    ShmPicoRingBuffer buffer(test_shm);
     ASSERT_TRUE(buffer.valid());
     ASSERT_TRUE(buffer.is_creator());
 
-    RealtimePowerSample sample{};
+    PicoSample sample{};
     sample.power_w = 10.5;
     sample.sequence_num = 1;
 
     buffer.push(sample);
-    // No assertion - just verify it doesn't crash
 
     shm_unlink(test_shm);
 }
@@ -112,64 +126,115 @@ TEST(HostClientCliTest, NoOnboardDisablesConfigEnabledSampler) {
 }
 
 TEST(PowerMonitorSessionRealtimeExportTest, PicoSamplesHaveMonotonicSequenceNumbers) {
-    shm_unlink(POWER_METRICS_SHM_NAME);
+    shm_unlink(PICO_METRICS_SHM_NAME);
 
     PowerMonitorSession::Options options;
     PowerMonitorSession session(options);
     session.session_->set_config(realtime_export_config());
 
-    PowerSpscBuffer reader(POWER_METRICS_SHM_NAME, kPowerMetricsVersion, buffers::ShmOpenMode::open);
+    PicoSpscBuffer reader(PICO_METRICS_SHM_NAME, kPicoMetricsVersion, buffers::ShmOpenMode::open);
     ASSERT_TRUE(reader.valid());
 
-    session.export_pico_power_sample(pico_sample(1));
-    session.export_pico_power_sample(pico_sample(2));
+    session.export_pico_power_sample(pico_session_sample(1));
+    session.export_pico_power_sample(pico_session_sample(2));
 
-    RealtimePowerSample first{};
-    RealtimePowerSample second{};
-    ASSERT_TRUE(pop_sample(reader, &first));
-    ASSERT_TRUE(pop_sample(reader, &second));
+    PicoSample first{};
+    PicoSample second{};
+    ASSERT_TRUE(pop_pico(reader, &first));
+    ASSERT_TRUE(pop_pico(reader, &second));
 
-    EXPECT_EQ(first.source, static_cast<uint32_t>(PowerSampleSource::kPico));
-    EXPECT_EQ(second.source, static_cast<uint32_t>(PowerSampleSource::kPico));
     EXPECT_LT(first.sequence_num, second.sequence_num);
 
-    shm_unlink(POWER_METRICS_SHM_NAME);
+    shm_unlink(PICO_METRICS_SHM_NAME);
+}
+
+TEST(PowerMonitorSessionRealtimeExportTest, PicoSampleExportsEnergyJ) {
+    shm_unlink(PICO_METRICS_SHM_NAME);
+
+    PowerMonitorSession::Options options;
+    PowerMonitorSession session(options);
+    session.session_->set_config(realtime_export_config());
+
+    PicoSpscBuffer reader(PICO_METRICS_SHM_NAME, kPicoMetricsVersion, buffers::ShmOpenMode::open);
+    ASSERT_TRUE(reader.valid());
+
+    Session::Sample sample = pico_session_sample(1);
+    sample.energy_raw = 1234;
+
+    session.export_pico_power_sample(sample);
+
+    PicoSample exported{};
+    ASSERT_TRUE(pop_pico(reader, &exported));
+
+    const double current_lsb = realtime_export_config().current_lsb_nA * 1e-9;
+    EXPECT_DOUBLE_EQ(exported.energy_j, sample.energy_raw * current_lsb * 3.2 * 16.0);
+
+    shm_unlink(PICO_METRICS_SHM_NAME);
+}
+
+TEST(PowerMonitorSessionRealtimeExportTest, OnboardSamplesCarryLatestPicoEnergyJ) {
+    shm_unlink(PICO_METRICS_SHM_NAME);
+    shm_unlink(ONBOARD_METRICS_SHM_NAME);
+
+    PowerMonitorSession::Options options;
+    PowerMonitorSession session(options);
+    session.session_->set_config(realtime_export_config());
+
+    PicoSpscBuffer pico_reader(PICO_METRICS_SHM_NAME, kPicoMetricsVersion, buffers::ShmOpenMode::open);
+    OnboardSpscBuffer onboard_reader(ONBOARD_METRICS_SHM_NAME, kOnboardMetricsVersion, buffers::ShmOpenMode::open);
+    ASSERT_TRUE(pico_reader.valid());
+    ASSERT_TRUE(onboard_reader.valid());
+
+    Session::Sample pico_s = pico_session_sample(1);
+    pico_s.energy_raw = 1234;
+
+    session.export_pico_power_sample(pico_s);
+    session.export_onboard_power_sample(onboard_session_sample(2));
+
+    PicoSample pico_exported{};
+    OnboardShmSample onboard_exported{};
+    ASSERT_TRUE(pop_pico(pico_reader, &pico_exported));
+    ASSERT_TRUE(pop_onboard(onboard_reader, &onboard_exported));
+
+    const double current_lsb = realtime_export_config().current_lsb_nA * 1e-9;
+    const double expected_energy_j = pico_s.energy_raw * current_lsb * 3.2 * 16.0;
+    EXPECT_DOUBLE_EQ(pico_exported.energy_j, expected_energy_j);
+
+    shm_unlink(PICO_METRICS_SHM_NAME);
+    shm_unlink(ONBOARD_METRICS_SHM_NAME);
 }
 
 TEST(PowerMonitorSessionRealtimeExportTest, OnboardSamplesHaveMonotonicSequenceNumbers) {
-    shm_unlink(POWER_METRICS_SHM_NAME);
+    shm_unlink(ONBOARD_METRICS_SHM_NAME);
 
     PowerMonitorSession::Options options;
     PowerMonitorSession session(options);
 
-    PowerSpscBuffer reader(POWER_METRICS_SHM_NAME, kPowerMetricsVersion, buffers::ShmOpenMode::open);
+    OnboardSpscBuffer reader(ONBOARD_METRICS_SHM_NAME, kOnboardMetricsVersion, buffers::ShmOpenMode::open);
     ASSERT_TRUE(reader.valid());
 
-    session.export_onboard_power_sample(onboard_sample(1));
-    session.export_onboard_power_sample(onboard_sample(2));
+    session.export_onboard_power_sample(onboard_session_sample(1));
+    session.export_onboard_power_sample(onboard_session_sample(2));
 
-    RealtimePowerSample first{};
-    RealtimePowerSample second{};
-    ASSERT_TRUE(pop_sample(reader, &first));
-    ASSERT_TRUE(pop_sample(reader, &second));
+    OnboardShmSample first{};
+    OnboardShmSample second{};
+    ASSERT_TRUE(pop_onboard(reader, &first));
+    ASSERT_TRUE(pop_onboard(reader, &second));
 
-    EXPECT_EQ(first.source, static_cast<uint32_t>(PowerSampleSource::kOnboard));
-    EXPECT_EQ(second.source, static_cast<uint32_t>(PowerSampleSource::kOnboard));
     EXPECT_LT(first.sequence_num, second.sequence_num);
 
-    shm_unlink(POWER_METRICS_SHM_NAME);
+    shm_unlink(ONBOARD_METRICS_SHM_NAME);
 }
 
 TEST(ShmPowerSpscTest, OverflowCount) {
-    const char* test_shm = "/test_power_spsc_overflow";
+    const char* test_shm = "/test_pico_spsc_overflow";
     shm_unlink(test_shm);
 
-    ShmPowerRingBuffer buffer(test_shm);
+    ShmPicoRingBuffer buffer(test_shm);
     ASSERT_TRUE(buffer.valid());
 
-    // Push more than capacity to trigger overflow
-    for (size_t i = 0; i < kPowerMetricsRingCapacity + 100; ++i) {
-        RealtimePowerSample sample{};
+    for (size_t i = 0; i < kPicoMetricsRingCapacity + 100; ++i) {
+        PicoSample sample{};
         sample.sequence_num = i;
         buffer.push(sample);
     }
@@ -180,7 +245,7 @@ TEST(ShmPowerSpscTest, OverflowCount) {
 }
 
 TEST(ShmPowerSpscTest, CrossProcessPushPop) {
-    const char* test_shm = "/test_power_spsc_ipc";
+    const char* test_shm = "/test_pico_spsc_ipc";
     shm_unlink(test_shm);
 
     pid_t pid = fork();
@@ -188,35 +253,29 @@ TEST(ShmPowerSpscTest, CrossProcessPushPop) {
 
     if (pid == 0) {
         // Child: writer
-        ShmPowerRingBuffer writer(test_shm);
+        ShmPicoRingBuffer writer(test_shm);
         if (!writer.valid()) exit(1);
 
         for (int i = 0; i < 10; ++i) {
-            RealtimePowerSample sample{};
+            PicoSample sample{};
             sample.sequence_num = i;
             sample.power_w = static_cast<double>(i) * 1.5;
             writer.push(sample);
         }
         exit(0);
     } else {
-        // Parent: reader (use SPSC directly)
-        usleep(10000);  // Wait for writer to start
+        // Parent: reader
+        usleep(10000);
 
-        using PowerSpscBuffer = buffers::spsc_ring_buffer<
-            RealtimePowerSample,
-            kPowerMetricsRingCapacity,
-            buffers::ShmStorage
-        >;
-
-        PowerSpscBuffer reader(test_shm, kPowerMetricsVersion, buffers::ShmOpenMode::open);
+        PicoSpscBuffer reader(test_shm, kPicoMetricsVersion, buffers::ShmOpenMode::open);
         ASSERT_TRUE(reader.valid());
 
         int expected = 0;
         int attempts = 0;
         while (expected < 10 && attempts < 1000) {
-            RealtimePowerSample sample;
+            PicoSample sample;
             if (reader.try_pop(sample)) {
-                EXPECT_EQ(sample.sequence_num, expected);
+                EXPECT_EQ(sample.sequence_num, static_cast<uint64_t>(expected));
                 EXPECT_DOUBLE_EQ(sample.power_w, static_cast<double>(expected) * 1.5);
                 ++expected;
             }
