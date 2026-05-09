@@ -1,49 +1,90 @@
-# CLAUDE.md
+# powermonitor/CLAUDE.md
 
-## Step 1
+This file provides guidance for working with the powermonitor system.
 
-Read the first word of the request, and read an additional instruction file when it is:
-- "design": REPO-ROOT/.github/prompts/design.prompt.md
-- "verify": REPO-ROOT/.github/prompts/verify.prompt.md
-- "ask": REPO-ROOT/.github/prompts/ask.prompt.md
-- "investigate": REPO-ROOT/.github/prompts/investigate.prompt.md
-- "code": REPO-ROOT/.github/prompts/code.prompt.md
-- "review": REPO-ROOT/.github/prompts/review.prompt.md
+## Overview
 
-### Exceptions
+The `powermonitor/` directory contains a power monitoring system with four major components:
+- **Pico firmware** — RP2040-based INA228 sensor reader (`device/`)
+- **PC client** — Host-side serial client that collects samples and writes SHM + JSON (`pc_client/`)
+- **Web viewer** — React timeline visualization for power + latency data (`web_viewer/`)
+- **Kernel module** — Jetson frequency control + readback via /proc (`jetson_freq_reader/`)
 
-- If the first word is not in the list:
-  - Follow REPO-ROOT/.github/prompts/code.prompt.md
-  - Skip Step 2
+## Building
 
-## Step 2
+### PC Client (C++17, CMake)
 
-Only applies when the first word is "design" or "investigate".
-Read the second word if it exists, convert it to a title `# THE-WORD`.
-
-## Step 3
-
-Keep the remaining as is.
-Treat the processed request as "the LATEST chat message" in the additional instruction file.
-Follow the additional instruction file and start working immediately, there will be no more input.
-
-## Examples
-
-When the request is `ask how does the parser resync on noise`, follow `ask.prompt.md` and "the LATEST chat message" becomes:
-```
-how does the parser resync on noise
+```bash
+cd powermonitor
+cmake -B build && cmake --build build -j$(nproc)
 ```
 
-When the request is `design problem add PING message`, follow `design.prompt.md` and "the LATEST chat message" becomes:
-```
-# Problem
-add PING message
+### Pico Firmware (Pico SDK)
+
+```bash
+cd powermonitor/device
+cmake -B build && cmake --build build -j$(nproc)
 ```
 
-When the request is `fix the CRC bug in parser`, since the first word is not in the list, follow `code.prompt.md` and "the LATEST chat message" becomes:
+### Web Viewer (React + Vite)
+
+```bash
+cd powermonitor/web_viewer
+npm install
+npm run dev          # Dev server
+npm run build:web    # Production build
 ```
-fix the CRC bug in parser
+
+### Kernel Module (jetson_freq_reader)
+
+```bash
+cd powermonitor/jetson_freq_reader && make
+sudo insmod jetson_freq_reader.ko
 ```
+
+See `scheduler/CLAUDE.md` for the full kernel module API (`/proc/jetson_freqs`, `/proc/jetson_freqs_set`).
+
+## PC Client
+
+The pc_client connects to a Pico via USB serial, collects power samples, and can:
+- Write JSON output files (for offline analysis)
+- Write to Power SHM ring buffer (for realtime DVFS control)
+
+Key source files:
+- `pc_client/src/main.cpp` — CLI entry point (CLI11, YAML config)
+- `pc_client/src/power_monitor_session.cpp` — Session management
+- `pc_client/src/onboard_sampler.cpp` — Jetson Nano onboard telemetry (INA3221, freq, thermal)
+- `pc_client/include/realtime_power_metrics.h` — SHM header layout
+- `pc_client/include/shm_power_ring_buffer.h` — SHM ring buffer helper
+
+When running with `--shm`, pc_client writes to `/powermonitor_power_metrics` SHM for the scheduler to read. When running without, it writes JSON to disk.
+
+## Pico Firmware
+
+RP2040 firmware that reads INA228 power sensors via I2C and streams samples over USB serial.
+
+Key source files:
+- `device/powermonitor.cpp` — Main firmware (dual-core)
+- `device/INA228.cpp/hpp` — INA228 sensor driver
+- `device/sampler.hpp` — Sampling logic
+- `device/command_handler.hpp` — Command processing
+- `device/pio_i2c.c/h` — PIO-based I2C bitbang
+
+Protocol: UART framing with CRC16. See `docs/uart_protocol.md` for details.
+
+## Web Viewer
+
+Browser-based timeline/Gantt visualization for power + latency JSON data.
+
+Key source files:
+- `web_viewer/src/App.tsx` — Main React component
+- `web_viewer/src/components/GanttPanel.tsx` — Gantt/timeline visualization
+- `web_viewer/src/components/TimelineChart.tsx` — Chart component
+- `web_viewer/src/domain/parsePayload.ts` — JSON parser
+
+## UART Protocol
+
+See `docs/uart_protocol.md` for the full protocol specification including frame format, CRC, and command set.
 
 ## Web Viewer Data Samples
 
