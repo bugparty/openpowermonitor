@@ -60,3 +60,5 @@ GacUI-master
 
 # Claude Code worktrees and settings
 .claude/
+!.claude/agents/
+!.claude/agents/**
