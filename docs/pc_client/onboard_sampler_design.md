@@ -21,7 +21,7 @@ The sampler uses two independent threads to maximize throughput:
 
 ```
 ┌─────────────────────────────────┐    ┌─────────────────────────────────┐
-│     INA Thread (high-rate)       │    │   Telemetry Thread (10 Hz)      │
+│     INA Thread (high-rate)       │    │   Telemetry Thread (100 Hz)     │
 │                                  │    │                                 │
 │  ┌───────────────────────────┐  │    │  ┌───────────────────────────┐  │
 │  │ read in1,c1,in2,c2,in3,c3 │  │    │  │ read GPU/CPU/EMC freq    │  │
@@ -39,13 +39,13 @@ The sampler uses two independent threads to maximize throughput:
 │  └───────────────────────────┘  │    │  │ ~1 µs total              │  │
 │              │                   │    │  └───────────────────────────┘  │
 │              ▼                   │    │              │                  │
-│  sleep until next tick          │    │  sleep 100 ms                   │
+│  sleep until next tick          │    │  sleep 10 ms                    │
 │  (TIMER_ABSTIME)                │    │  (TIMER_ABSTIME)                │
 └─────────────────────────────────┘    └─────────────────────────────────┘
                   │                                    │
                   ▼                                    ▼
-           ~270 Hz effective                    10 Hz fixed rate
-           (limited by I2C)                     (configurable)
+           ~270 Hz effective                    100 Hz (configurable)
+           (limited by I2C)                     (default --onboard-telemetry-period-us 10000)
 ```
 
 ### Why Two Threads?
@@ -55,7 +55,7 @@ The INA3221 power sensor has an inherent I2C transaction latency of ~590 µs per
 By separating the telemetry reads (GPU/CPU/EMC/temps/fan) into a parallel thread:
 
 - INA samples at ~270 Hz (limited by I2C hardware, not software)
-- Telemetry updates at 10 Hz (sufficient for frequency/temperature changes)
+- Telemetry updates at 100 Hz (configurable, sufficient for frequency/temperature tracking)
 - No blocking between the two paths
 
 ### Shared State
@@ -89,7 +89,7 @@ The INA thread snapshots telemetry data while holding the lock, then releases im
 | Thread | Target | Actual | Limiting Factor |
 |--------|--------|--------|-----------------|
 | INA | 1 kHz | ~270 Hz | I2C hardware (~590 µs/channel) |
-| Telemetry | 10 Hz | 10 Hz | Software-configurable |
+| Telemetry | 100 Hz | 100 Hz | Software-configurable via `--onboard-telemetry-period-us` |
 
 ### Why Not 1 kHz for INA?
 
@@ -171,9 +171,8 @@ Options to achieve higher INA sample rates:
 sudo ./host_pc_client --onboard \
     --onboard-path /sys/class/hwmon/hwmon1 \
     --onboard-period-us 1000 \
-    --onboard-cpu-cluster0-freq /sys/devices/system/cpu/cpufreq/policy0/cpuinfo_cur_freq \
-    --onboard-cpu-cluster1-freq /sys/devices/system/cpu/cpufreq/policy4/cpuinfo_cur_freq \
-    --onboard-emc-freq /sys/kernel/debug/clk/emc/clk_rate \
+    --onboard-telemetry-period-us 10000 \
+    --jetson-freq-path /proc/jetson_freqs \
     --duration-s 60
 ```
 
@@ -181,10 +180,9 @@ sudo ./host_pc_client --onboard \
 |--------|---------|-------------|
 | `--onboard` | (off) | Enable onboard sampling |
 | `--onboard-path` | `/sys/class/hwmon/hwmon1` | INA3221 hwmon path |
-| `--onboard-period-us` | `1000` | INA sample period (µs) |
-| `--onboard-cpu-cluster0-freq` | (empty) | CPU cluster 0 freq sysfs path |
-| `--onboard-cpu-cluster1-freq` | (empty) | CPU cluster 1 freq sysfs path |
-| `--onboard-emc-freq` | (empty) | EMC freq sysfs path |
+| `--onboard-period-us` | `1000` | INA thread sample period (µs) |
+| `--onboard-telemetry-period-us` | `10000` | Telemetry thread sample period (µs) |
+| `--jetson-freq-path` | `/proc/jetson_freqs` | Path to jetson_freq_reader kernel module output |
 
 ### Running as Root
 
@@ -215,9 +213,9 @@ This allows plain `open()/read()` syscalls without sudo subprocess overhead (~15
 
 ### Telemetry Data Freshness
 
-- Telemetry fields are updated at 10 Hz by the telemetry thread
+- Telemetry fields are updated at 100 Hz (configurable via `--onboard-telemetry-period-us`) by the telemetry thread
 - INA thread snapshots the current values on each sample
-- Maximum staleness: 100 ms for frequency/temperature data
+- Maximum staleness: 10 ms (default) for frequency/temperature data
 - Power data is always fresh (read directly in INA thread)
 
 ### Error Handling
@@ -236,7 +234,7 @@ Only the INA thread applies RT scheduling (`SCHED_FIFO`) and CPU affinity:
 apply_thread_affinity();  // Sets RT priority if configured
 
 // Telemetry thread
-// No RT priority needed: 10 Hz is low-rate
+// No RT priority: telemetry is less latency-critical than the INA thread
 ```
 
 ## Troubleshooting
@@ -271,6 +269,5 @@ Solution: Always run as `sudo ./host_pc_client --onboard ...`
 ## Future Improvements
 
 1. **Batch INA reads**: Modify kernel driver to read all channels in one I2C transaction
-2. **Higher telemetry rate**: Make 10 Hz configurable if needed
-3. **Voltage rails**: Add in4-in7 if monitoring additional power rails becomes necessary
-4. **Alternative sensors**: Support non-INA3221 power monitors with faster sampling
+2. **Voltage rails**: Add in4-in7 if monitoring additional power rails becomes necessary
+3. **Alternative sensors**: Support non-INA3221 power monitors with faster sampling

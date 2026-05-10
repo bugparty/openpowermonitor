@@ -28,7 +28,7 @@ class OnboardSampleQueue;
  *   Reads INA3221 in1-3 (V×I = power) at the configured period (default 1 kHz).
  *   Acquires shared lock, fills power fields, releases, pushes to queue.
  *
- * Thread 2 - Telemetry thread (low-rate, 10 Hz):
+ * Thread 2 - Telemetry thread (configurable, default 100 Hz):
  *   Reads GPU/CPU/EMC freq, thermal zones, fan RPM.
  *   Acquires shared lock, fills telemetry fields (INA fields stay stale).
  *
@@ -39,6 +39,7 @@ class OnboardSampleQueue;
  * Configuration:
  *   - hwmon_path: Path to hwmon directory (default: /sys/class/hwmon/hwmon1)
  *   - period_us: INA thread sampling period in microseconds (default: 1000 = 1 kHz)
+ *   - telemetry_period_us: Telemetry thread period in microseconds (default: 10000 = 100 Hz)
  *   - cpu_core: CPU core affinity for INA thread (-1 = no affinity)
  *   - rt_prio: Real-time priority for INA thread (-1 = disabled)
  *   - jetson_freq_path: Path to /proc/jetson_freqs (requires kernel module)
@@ -47,7 +48,8 @@ class OnboardSampler {
 public:
     struct Config {
         std::string hwmon_path = "/sys/class/hwmon/hwmon1";
-        uint64_t period_us = 1000;  // INA thread period in microseconds (default: 1 kHz)
+        uint64_t period_us = 1000;          // INA thread period in microseconds (default: 1 kHz)
+        uint64_t telemetry_period_us = 10000; // Telemetry thread period in microseconds (default: 100 Hz)
         int cpu_core = -1;          // CPU core affinity for INA thread (-1 = disabled)
         int rt_prio = -1;           // RT priority for INA thread (-1 = disabled)
 
@@ -104,7 +106,7 @@ private:
     void ina_loop();
 
     /**
-     * @brief Telemetry thread: reads GPU/CPU/EMC freq + temps + fan at 10 Hz
+     * @brief Telemetry thread: reads GPU/CPU/EMC freq + temps + fan at configurable rate (default 100 Hz)
      */
     void telemetry_loop();
 

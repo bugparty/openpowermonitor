@@ -117,6 +117,7 @@ struct ConfigOptions {
     bool onboard_enabled = false;
     std::string onboard_hwmon_path = "/sys/class/hwmon/hwmon1";
     uint64_t onboard_period_us = 1000;
+    uint64_t onboard_telemetry_period_us = 10000;
     int onboard_cpu_core = -1;
     int onboard_rt_prio = -1;
     std::string onboard_jetson_freq_path = "/proc/jetson_freqs";
@@ -236,6 +237,9 @@ bool load_yaml_config(const std::string &path, ConfigOptions &options) {
         }
         if (onboard["period_us"] && onboard["period_us"].IsScalar()) {
             options.onboard_period_us = onboard["period_us"].as<uint64_t>();
+        }
+        if (onboard["telemetry_period_us"] && onboard["telemetry_period_us"].IsScalar()) {
+            options.onboard_telemetry_period_us = onboard["telemetry_period_us"].as<uint64_t>();
         }
         if (onboard["cpu_core"] && onboard["cpu_core"].IsScalar()) {
             options.onboard_cpu_core = onboard["cpu_core"].as<int>();
@@ -379,7 +383,8 @@ int main(int argc, char **argv) {
     // --no-onboard is the explicit negation of --onboard (onboard_enabled defaults to false)
     auto opt_no_onboard = app.add_flag("--no-onboard", no_onboard, "Disable onboard hwmon power sampling");
     app.add_option("--onboard-path", options.onboard_hwmon_path, "Hwmon path (default: /sys/class/hwmon/hwmon1)");
-    app.add_option("--onboard-period-us", options.onboard_period_us, "Onboard sampling period in microseconds");
+    app.add_option("--onboard-period-us", options.onboard_period_us, "INA thread sampling period in microseconds (default: 1000 = 1 kHz)");
+    app.add_option("--onboard-telemetry-period-us", options.onboard_telemetry_period_us, "Telemetry thread sampling period in microseconds (default: 10000 = 100 Hz)");
     app.add_option("--onboard-core", options.onboard_cpu_core, "CPU core for onboard sampler thread");
     app.add_option("--onboard-rt-prio", options.onboard_rt_prio, "RT priority for onboard sampler");
     app.add_option("--jetson-freq-path", options.onboard_jetson_freq_path,
@@ -596,6 +601,7 @@ int main(int argc, char **argv) {
     session_options.onboard_enabled = options.onboard_enabled;
     session_options.onboard_hwmon_path = options.onboard_hwmon_path;
     session_options.onboard_period_us = options.onboard_period_us;
+    session_options.onboard_telemetry_period_us = options.onboard_telemetry_period_us;
     session_options.onboard_cpu_core = options.onboard_cpu_core;
     session_options.onboard_rt_prio = options.onboard_rt_prio;
     session_options.onboard_jetson_freq_path = options.onboard_jetson_freq_path;

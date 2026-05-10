@@ -110,6 +110,10 @@ bool OnboardSampler::start() {
         last_error_ = "Invalid period_us: must be > 0";
         return false;
     }
+    if (config_.telemetry_period_us == 0) {
+        last_error_ = "Invalid telemetry_period_us: must be > 0";
+        return false;
+    }
 
     stop_requested_ = false;
 
@@ -206,7 +210,7 @@ void OnboardSampler::ina_loop() {
         if (v3 && c3) s.vdd_soc_mw         = (*v3) * (*c3) / 1000LL;
         s.total_mw = s.vdd_in_mw + s.vdd_cpu_gpu_cv_mw + s.vdd_soc_mw;
 
-        // Snapshot telemetry (written by telemetry thread at 10 Hz)
+        // Snapshot telemetry (written by telemetry thread at configurable rate, default 100 Hz)
         {
             std::lock_guard<std::mutex> lock(shared_mutex_);
             s.gpu_freq_hz        = shared_sample_.gpu_freq_hz;
@@ -222,7 +226,7 @@ void OnboardSampler::ina_loop() {
             s.fan_rpm             = shared_sample_.fan_rpm;
         }
 
-        // Push to queue (INA data at 1 kHz, telemetry at stale-10 Hz)
+        // Push to queue (INA data at 1 kHz, telemetry at configurable rate)
         queue_->push(s);
 
         // Precise sleep until next tick
@@ -233,13 +237,13 @@ void OnboardSampler::ina_loop() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Telemetry thread: reads GPU/CPU/EMC freq + thermal zones + fan at 10 Hz.
-// No RT priority needed: 10 Hz is low-rate, INA thread (1 kHz) is the critical one.
-// Holds shared_mutex_ only while writing shared_sample_; the I/O (~0.8 ms)
+// Telemetry thread: reads GPU/CPU/EMC freq + thermal zones + fan (default 100 Hz).
+// No RT priority: telemetry is less latency-critical than the INA thread (1 kHz).
+// Holds shared_mutex_ only while writing shared_sample_; the I/O (~0.9 ms)
 // is done unlocked so it can overlap with the INA thread's idle/sleep time.
 // ─────────────────────────────────────────────────────────────────────────────
 void OnboardSampler::telemetry_loop() {
-    const int64_t period_ns = 100000000LL;  // 100 ms = 10 Hz
+    const int64_t period_ns = static_cast<int64_t>(config_.telemetry_period_us) * 1000LL;
     int64_t next_tick = now_ns(CLOCK_MONOTONIC);
 
     while (!stop_requested_.load()) {
@@ -273,7 +277,7 @@ void OnboardSampler::telemetry_loop() {
             shared_sample_.fan_rpm              = fan;
         }
 
-        // ── Sleep until next 10 Hz tick ───────────────────────────────────
+        // ── Sleep until next telemetry tick ────────────────────────────────
         next_tick += period_ns;
         const timespec ts = ns_to_ts(next_tick);
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);

@@ -257,6 +257,7 @@ int PowerMonitorSession::run() {
         OnboardSampler::Config onboard_cfg;
         onboard_cfg.hwmon_path = options_.onboard_hwmon_path;
         onboard_cfg.period_us = options_.onboard_period_us;
+        onboard_cfg.telemetry_period_us = options_.onboard_telemetry_period_us;
         onboard_cfg.cpu_core = options_.onboard_cpu_core;
         onboard_cfg.rt_prio = options_.onboard_rt_prio;
         onboard_cfg.jetson_freq_path = options_.onboard_jetson_freq_path;

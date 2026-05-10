@@ -54,6 +54,7 @@ public:
         bool onboard_enabled = false;
         std::string onboard_hwmon_path = "/sys/class/hwmon/hwmon1";
         uint64_t onboard_period_us = 1000;
+        uint64_t onboard_telemetry_period_us = 10000;
         int onboard_cpu_core = -1;
         int onboard_rt_prio = -1;
 
