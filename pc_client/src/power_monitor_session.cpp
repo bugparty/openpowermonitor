@@ -342,6 +342,15 @@ int PowerMonitorSession::run() {
     }
 
     append_log("Stopping session...");
+
+    // Tell the device to stop streaming BEFORE raising stop_requested_:
+    // that flag aborts send_command_with_retry/wait_for_response and stops
+    // the read thread, so a STREAM_STOP attempted after it can never
+    // complete and the device would keep streaming into the next session.
+    if (streaming_.load()) {
+        stop_streaming();
+    }
+
     stop_requested_ = true;
     sample_queue_->stop();
 
@@ -351,10 +360,6 @@ int PowerMonitorSession::run() {
         if (onboard_queue_) {
             onboard_queue_->stop();
         }
-    }
-
-    if (streaming_.load()) {
-        stop_streaming();
     }
 
 
@@ -477,6 +482,39 @@ bool PowerMonitorSession::initialize_device() {
     while (sample_queue_->pop(dropped_sample)) {
     }
 
+    // Apply user-supplied INA228 configuration overrides (e.g.
+    // --adc-config-reg) by sending SET_CFG after StreamStop and before
+    // streaming begins. Without this, the device retains its
+    // firmware-default ADC_CONFIG and the --adc-config-reg flag is
+    // silently dropped (latent bug fixed 2026-05-27).
+    if (options_.config_overridden) {
+        // FIXME(2026-05-27): SET_CFG path is structurally complete
+        // (plumbing in this file + main.cpp + Options + send_set_cfg)
+        // but exercising it wedges the Pico firmware: both PING and
+        // sample production stop responding until the Pico is
+        // re-flashed AND power-cycled to reset the INA228.
+        //
+        // Empirically: pc_client sends kSetCfg, the device-side handler
+        // (powermonitor/device/command_handler.hpp:283) appears to hang
+        // or trip a watchdog reset before the RSP can be transmitted.
+        // The most likely root cause is bus contention --- Core 1 drives
+        // the SDA/SCL pins via the PIO-based bitbang I2C used by the
+        // sampler, while Core 0's handle_set_cfg uses the Pico SDK
+        // hardware I2C peripheral on the same pins (see
+        // powermonitor/device/INA228.cpp:54 i2c_write_blocking vs
+        // sampler.hpp:10 pio_i2c.h). Until handle_set_cfg is rewritten
+        // to use the PIO path (or the cores coordinate exclusive bus
+        // access), do not actually transmit the override.
+        std::cerr << "[WARN] --adc-config-reg / --config-reg / "
+                  << "--shunt-cal / --shunt-tempco are parsed but the "
+                  << "SET_CFG send is currently disabled in pc_client "
+                  << "(thesis Ch7 limitation; PIO/hw-I2C contention "
+                  << "wedges the Pico). Running with firmware defaults."
+                  << std::endl;
+        append_log("WARN: config overrides parsed but SET_CFG send disabled");
+        // Intentionally NOT calling send_set_cfg() here.
+    }
+
     // Set initial epoch with TIME_SET (Unix time), then fine-tune with TIME_SYNC rounds (Unix time on both sides).
     {
         std::vector<uint8_t> time_set_payload;
@@ -550,6 +588,33 @@ bool PowerMonitorSession::get_device_config() {
     session_->set_config(config);
 
     return true;
+}
+
+bool PowerMonitorSession::send_set_cfg() {
+    // SetCfgPayload wire format (8 bytes, little-endian, packed):
+    //   uint16_t config_reg
+    //   uint16_t adc_config_reg
+    //   uint16_t shunt_cal
+    //   uint16_t shunt_tempco
+    // Device side handler is in powermonitor/device/command_handler.hpp:283
+    std::vector<uint8_t> payload(8);
+    pack_u16(payload.data() + 0, options_.config_reg);
+    pack_u16(payload.data() + 2, options_.adc_config_reg);
+    pack_u16(payload.data() + 4, options_.shunt_cal);
+    pack_u16(payload.data() + 6, options_.shunt_tempco);
+
+    const bool ok = send_command_with_retry(protocol::MsgId::kSetCfg, payload);
+    if (ok) {
+        std::ostringstream oss;
+        oss << "SET_CFG sent: config_reg=0x" << std::hex << options_.config_reg
+            << " adc_config_reg=0x" << options_.adc_config_reg
+            << " shunt_cal=0x" << options_.shunt_cal
+            << " shunt_tempco=0x" << options_.shunt_tempco;
+        append_log(oss.str());
+    } else {
+        std::cerr << "SET_CFG failed" << std::endl;
+    }
+    return ok;
 }
 
 bool PowerMonitorSession::start_streaming() {
@@ -1208,7 +1273,9 @@ int PowerMonitorSession::run_tui_loop() {
 
     renderer = CatchEvent(renderer, [&](Event event) {
         if (event == Event::Character('q') || event == Event::Character('Q') || event == Event::CtrlC) {
-            stop_requested_.store(true);
+            // Exit the TUI loop only; run()'s shutdown block must still be
+            // able to send STREAM_STOP, which stop_requested_ would prevent.
+            quit_requested_.store(true);
             return true;
         }
         if (event == Event::Character('s') || event == Event::Character('S')) {
@@ -1227,10 +1294,9 @@ int PowerMonitorSession::run_tui_loop() {
     });
 
     Loop loop(&screen, renderer);
-    while (!stop_requested_.load() && !loop.HasQuitted()) {
+    while (!stop_requested_.load() && !quit_requested_.load() && !loop.HasQuitted()) {
         if (g_signal_interrupted.load()) {
-            stop_requested_.store(true);
-            break;
+            break;  // run()'s shutdown block sends STREAM_STOP, then stops
         }
 
         protocol::DynamicFrame async_frame;

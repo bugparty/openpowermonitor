@@ -161,6 +161,36 @@ enable_testing()
 include(GoogleTest)
 gtest_discover_tests(pc_client_tests)
 
+if(UNIX)
+    # E2E session shutdown test: runs a real PowerMonitorSession against a
+    # fake device on a PTY pair, so it needs the full session (and its ftxui
+    # dependency) but no hardware. POSIX-only (PTY).
+    add_executable(session_shutdown_test
+        tests/session_shutdown_tests.cpp
+        src/power_monitor_session.cpp
+    )
+
+    target_link_libraries(session_shutdown_test PRIVATE
+        pc_client_lib
+        CLI11::CLI11
+        ftxui::screen
+        ftxui::dom
+        ftxui::component
+        gtest_main
+        pthread
+    )
+
+    target_include_directories(session_shutdown_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../protocol
+    )
+
+    target_compile_definitions(session_shutdown_test PRIVATE ASIO_STANDALONE)
+
+    gtest_discover_tests(session_shutdown_test)
+endif()
+
 add_executable(shm_spsc_test
     tests/shm_spsc_test.cpp
 )

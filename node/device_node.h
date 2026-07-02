@@ -16,6 +16,10 @@ public:
 
     void tick(uint64_t now_us);
 
+    // Device clock error relative to the simulation clock (the host reference).
+    // After a perfect sync, this converges to 0. Exposed for time-sync tests.
+    int64_t epoch_offset_us() const { return epoch_offset_us_; }
+
 private:
     void on_frame(const protocol::DynamicFrame &frame, uint64_t receive_time_us);
     void handle_cmd(const protocol::DynamicFrame &frame, uint64_t now_us);

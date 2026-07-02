@@ -294,7 +294,19 @@ private:
         ctx_.shunt_cal = cfg->shunt_cal;
         ctx_.shunt_tempco = cfg->shunt_tempco;
 
-        // Update hardware registers
+        // Update hardware registers. NOTE(2026-05-27): the four
+        // INA228::write_register16 calls below use Pico SDK hardware
+        // I2C, while the sampler running on Core 1 drives the same
+        // SDA/SCL pins via PIO bitbang (see sampler.hpp:10 and
+        // INA228.cpp:307). When this handler is invoked while the
+        // sampler timer is active, the two I2C masters collide and the
+        // hardware-I2C call hangs (observed empirically: pc_client
+        // SET_CFG times out, then PING also times out, and the chip
+        // recovers only after a Pico re-flash + power cycle).
+        // Pc_client currently does not invoke SET_CFG because of this;
+        // the proper fix is to rewrite these writes through pio_i2c so
+        // both masters share the same bus driver. Until then this
+        // handler is kept in its original form for protocol coverage.
         if (ctx_.ina228) {
             bool ok = true;
             ok &= ctx_.ina228->write_register16(INA228::INA228_Register::CONFIG, cfg->config_reg);

@@ -207,6 +207,11 @@ int main() {
 
   // Initialize INA228
   INA228 ina228(I2C_PORT, INA228_ADDR, INA228_SHUNT_OHMS);
+  // Software reset before configure() — recovers the chip from any
+  // degenerate state left by a previous bad SET_CFG sequence, since
+  // INA228 has its own VDD and is not power-cycled by a Pico reflash.
+  (void)ina228.reset_all();
+  sleep_ms(20);
   ina228.configure();
   g_ctx.ina228 = &ina228;
   g_ctx.adcrange = ina228.get_adc_range();

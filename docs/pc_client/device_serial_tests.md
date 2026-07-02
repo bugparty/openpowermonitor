@@ -81,3 +81,20 @@ A design for gtest-based on-device functional tests that reuse `pc_client` facil
 - New CMake target `pc_client_tests` built under `pc_client/tests`.
 - Tests implement the ordered list above with abort-on-risk behavior.
 - Documentation here kept in sync with test code per `docs/naming_convention.md`.
+
+## Hardware-Free Session Shutdown E2E Test
+
+Separate from the on-device tests above, `pc_client/tests/session_shutdown_tests.cpp`
+(CMake target `session_shutdown_test`, POSIX-only) runs a real
+`PowerMonitorSession` end to end against a fake device on a PTY pair — no
+hardware required. The fake device speaks the real protocol
+(`protocol::Parser` + `protocol::build_frame`), answers the full init
+handshake (PING, GET_CFG + CFG_REPORT, STREAM_STOP, TIME_SET, TIME_SYNC
+rounds, STREAM_START), and records the order of received commands.
+
+### `StreamStopIsSentOnDurationShutdown`
+Runs a session with a short `duration_us` and asserts a `STREAM_STOP` is
+received *after* the last `STREAM_START` (the init-time stop does not
+count). Regression test for the shutdown-ordering bug where
+`stop_requested_` was raised before `stop_streaming()`, so the stop command
+was short-circuited and the device kept streaming after every normal exit.

@@ -1,3 +1,6 @@
+#include <algorithm>
+#include <cstdlib>
+
 #include <gtest/gtest.h>
 #include "node/device_node.h"
 #include "node/pc_node.h"
@@ -145,6 +148,151 @@ TEST_F(PowerMonitorTest, TimeSynchronizationSequence) {
 
     EXPECT_EQ(pc->timeout_count(), 0)              << "Timeouts during TIME_SET";
     EXPECT_EQ(pc->get_rx_count(kMsgTimeSet), 1)    << "TIME_SET RSP missing";
+}
+
+// ---------------------------------------------------------------------------
+// Fixture: PC + Device over a deterministic link (fixed symmetric delay,
+// whole-frame chunks, no faults) for time-sync clock-error experiments.
+// The device clock error is injected via TIME_SET and observed through
+// DeviceNode::epoch_offset_us(): 0 means the device Unix clock matches the
+// simulation (host) clock exactly.
+// ---------------------------------------------------------------------------
+class TimeSyncClockErrorTest : public ::testing::Test {
+protected:
+    static constexpr int64_t kLinkDelayUs = 500;
+
+    void SetUp() override {
+        sim::LinkConfig config;
+        config.min_chunk = 64;
+        config.max_chunk = 64;
+        config.min_delay_us = kLinkDelayUs;
+        config.max_delay_us = kLinkDelayUs;
+        config.drop_prob = 0.0;
+        config.flip_prob = 0.0;
+        link.set_pc_to_dev_config(config);
+        link.set_dev_to_pc_config(config);
+
+        pc = std::make_unique<node::PCNode>(&link.pc());
+        device = std::make_unique<node::DeviceNode>(&link.device());
+    }
+
+    void RunSimulation(uint64_t duration_us, uint64_t tick_interval_us) {
+        loop.run_for(duration_us, tick_interval_us, [&](uint64_t now_us) {
+            link.pump(now_us);
+            pc->tick(now_us);
+            device->tick(now_us);
+        });
+    }
+
+    // Injects a device clock error of ~error_us (minus one link delay, since
+    // TIME_SET carries the PC send-time and is applied on arrival).
+    void InjectClockError(int64_t error_us) {
+        pc->send_time_set(loop.now_us() + static_cast<uint64_t>(error_us), loop.now_us());
+        RunSimulation(20'000, 100);
+    }
+
+    // Runs one TIME_SYNC exchange and returns the T1..T4 measurement.
+    node::PCNode::TimeSyncMeasurement RunSyncRound() {
+        const uint64_t completed_before = pc->last_time_sync().count;
+        pc->send_time_sync(loop.now_us());
+        RunSimulation(20'000, 100);
+        EXPECT_EQ(pc->last_time_sync().count, completed_before + 1)
+            << "TIME_SYNC exchange did not complete";
+        return pc->last_time_sync();
+    }
+
+    sim::VirtualLink link;
+    sim::EventLoop loop;
+    std::unique_ptr<node::PCNode> pc;
+    std::unique_ptr<node::DeviceNode> device;
+};
+
+// Verbatim replica of pc_client's offset policy
+// (pc_client/src/power_monitor_session.cpp: choose_offset(), plus
+// run_time_sync_rounds() which applies -min_element(offsets)).
+// Kept in sync by citation, not by linkage: the original lives in an
+// anonymous namespace inside the pc_client binary.
+namespace pc_client_policy {
+
+constexpr int64_t kAsymmetryThresholdUs = 2000;
+
+int64_t choose_offset(int64_t T1, int64_t T2, int64_t T3, int64_t T4) {
+    int64_t forward = T1 - T2;
+    int64_t reverse = T3 - T4;
+    int64_t offset_ntp = ((T1 - T2) + (T4 - T3)) / 2;
+    int64_t asym = llabs(forward - reverse);
+    if (asym > kAsymmetryThresholdUs) {
+        return forward;
+    }
+    return offset_ntp;
+}
+
+} // namespace pc_client_policy
+
+// With the spec offset formula (docs/protocol/uart_protocol.md §5.2:
+// offset = ((T2-T1)+(T3-T4))/2, TIME_ADJUST payload = -offset, as
+// implemented by PCNode's automatic handler), an injected device clock
+// error converges to ~0 within a few sync rounds.
+TEST_F(TimeSyncClockErrorTest, SpecOffsetFormulaConvergesDeviceClock) {
+    InjectClockError(100'000);
+    const int64_t initial_error = device->epoch_offset_us();
+    ASSERT_GT(initial_error, 90'000) << "Clock error injection failed";
+
+    for (int round = 0; round < 3; ++round) {
+        RunSyncRound();  // Auto TIME_ADJUST enabled by default
+    }
+    RunSimulation(20'000, 100);  // Let the last TIME_ADJUST land
+
+    EXPECT_LE(llabs(device->epoch_offset_us()), 50)
+        << "Spec offset formula must drive the device clock error to ~0";
+    EXPECT_EQ(pc->timeout_count(), 0);
+    EXPECT_EQ(pc->crc_fail_count(), 0);
+}
+
+// Regression demonstration for the pc_client time-sync sign bug:
+// power_monitor_session.cpp computes choose_offset() in the host-minus-device
+// convention (T1-T2 based) but still negates it when building the
+// TIME_ADJUST payload, so the applied correction has the wrong sign and the
+// device clock error roughly DOUBLES on every adjust cycle instead of
+// converging. This test replays that exact policy over the simulated link
+// and asserts the divergence. Once pc_client is fixed to send the spec
+// offset, this test should be inverted into a convergence check.
+TEST_F(TimeSyncClockErrorTest, PcClientOffsetPolicyDivergesDeviceClock) {
+    pc->set_auto_time_adjust(false);
+
+    InjectClockError(1'300);
+    const int64_t initial_error = device->epoch_offset_us();
+    ASSERT_GT(initial_error, 500) << "Clock error injection failed";
+
+    constexpr int kPeriodicSyncRounds = 3;  // Matches pc_client
+    constexpr int kAdjustCycles = 3;
+
+    int64_t previous_error = initial_error;
+    for (int cycle = 0; cycle < kAdjustCycles; ++cycle) {
+        std::vector<int64_t> offsets;
+        for (int round = 0; round < kPeriodicSyncRounds; ++round) {
+            const auto m = RunSyncRound();
+            offsets.push_back(pc_client_policy::choose_offset(
+                static_cast<int64_t>(m.t1), static_cast<int64_t>(m.t2),
+                static_cast<int64_t>(m.t3), static_cast<int64_t>(m.t4)));
+        }
+        // pc_client applies the minimum offset of the batch, negated.
+        const int64_t min_offset = *std::min_element(offsets.begin(), offsets.end());
+        pc->send_time_adjust(-min_offset, loop.now_us());
+        RunSimulation(20'000, 100);
+
+        const int64_t error = device->epoch_offset_us();
+        EXPECT_GE(llabs(error), (llabs(previous_error) * 3) / 2)
+            << "Cycle " << cycle << ": pc_client policy unexpectedly reduced the "
+            << "clock error - has the sign bug been fixed? If so, invert this test.";
+        previous_error = error;
+    }
+
+    EXPECT_GE(llabs(previous_error), 4 * initial_error)
+        << "pc_client offset policy (choose_offset + '-min_offset') should move "
+        << "the device clock AWAY from the host, doubling the error each cycle";
+    EXPECT_EQ(pc->timeout_count(), 0);
+    EXPECT_EQ(pc->crc_fail_count(), 0);
 }
 
 // ===========================================================================

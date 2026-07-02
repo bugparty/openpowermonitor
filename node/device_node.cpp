@@ -75,9 +75,13 @@ void DeviceNode::handle_cmd(const protocol::DynamicFrame &frame, uint64_t now_us
         // TIME_SYNC: Extract T1, capture T2 (immediately after parse), capture T3 (before send)
         if (frame.data.size() >= 8) {
             const uint64_t T1 = protocol::read_u64(frame.data, 0);
-            // T2 captured immediately after frame parsing completes
-            // In simulation, now_us represents the time when handle_cmd is called
-            const uint64_t T2 = now_us;
+            // T2 captured immediately after frame parsing completes.
+            // Like the firmware (device/command_handler.hpp handle_time_sync),
+            // T2/T3 are reported in the device's Unix domain: mono + epoch_offset.
+            // now_us is the simulated monotonic clock; epoch_offset_us_ carries
+            // the device clock error, so corrections via TIME_ADJUST are
+            // observable in subsequent exchanges.
+            const uint64_t T2 = now_us + static_cast<uint64_t>(epoch_offset_us_);
 
             // Build RSP payload: orig_msgid(1) + status(1) + T1(8) + T2(8) + T3(8)
             // Prepare all data except T3 first
@@ -87,7 +91,7 @@ void DeviceNode::handle_cmd(const protocol::DynamicFrame &frame, uint64_t now_us
 
             // All processing is done, capture T3 immediately before sending
             // In real implementation, this should be captured just before the serial write
-            const uint64_t T3 = now_us;
+            const uint64_t T3 = now_us + static_cast<uint64_t>(epoch_offset_us_);
             protocol::append_u64(rsp_data, T3);
 
             send_rsp(frame.seq, frame.msgid, kStatusOk, rsp_data, now_us);

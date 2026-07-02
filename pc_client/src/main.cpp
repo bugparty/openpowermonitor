@@ -605,6 +605,15 @@ int main(int argc, char **argv) {
     session_options.onboard_cpu_core = options.onboard_cpu_core;
     session_options.onboard_rt_prio = options.onboard_rt_prio;
     session_options.onboard_jetson_freq_path = options.onboard_jetson_freq_path;
+    // Carry INA228 register overrides into the session so SET_CFG actually
+    // reaches the device. Previously these fields existed on
+    // ConfigOptions but were dropped at this transfer, leaving
+    // --adc-config-reg as dead code on the wire side.
+    session_options.config_reg = options.config_reg;
+    session_options.adc_config_reg = options.adc_config_reg;
+    session_options.shunt_cal = options.shunt_cal;
+    session_options.shunt_tempco = options.shunt_tempco;
+    session_options.config_overridden = options.config_overridden;
 
     powermonitor::client::PowerMonitorSession session(session_options);
     try {

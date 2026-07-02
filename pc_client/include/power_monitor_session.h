@@ -63,6 +63,18 @@ public:
 
         // Flush interval for periodic data dump to chunks
         uint32_t flush_interval_s = 5;
+
+        // INA228 configuration override. If config_overridden is true,
+        // pc_client sends a SET_CFG command to the device after PING/GetCfg
+        // and before STREAM_START, writing these four registers into the
+        // INA228 via the firmware's existing handle_set_cfg path. Without
+        // this, the device uses whatever ADC_CONFIG is hardcoded in the
+        // firmware (typically 0xFB68 → ~316 Hz effective rate).
+        uint16_t config_reg = 0x0000;
+        uint16_t adc_config_reg = 0x1000;
+        uint16_t shunt_cal = 0x1000;
+        uint16_t shunt_tempco = 0x0000;
+        bool config_overridden = false;
     };
 
     explicit PowerMonitorSession(const Options& options);
@@ -79,6 +91,10 @@ private:
     bool initialize_device();
     bool send_ping();
     bool get_device_config();
+    // Sends a SET_CFG command to the device using options_.{config_reg,
+    // adc_config_reg, shunt_cal, shunt_tempco}. Called only when
+    // options_.config_overridden is true.
+    bool send_set_cfg();
     bool perform_time_sync_once(std::string* detail = nullptr, int64_t* out_offset = nullptr,
                                 bool send_adjust = true);
     bool run_time_sync_rounds(int rounds);
@@ -144,6 +160,9 @@ private:
      std::thread flush_thread_;
 
      std::atomic<bool> stop_requested_{false};
+     // User-initiated quit from the TUI ('q'/Ctrl+C). Distinct from
+     // stop_requested_ so the shutdown path can still send STREAM_STOP.
+     std::atomic<bool> quit_requested_{false};
      std::atomic<bool> interrupted_{false};
      std::atomic<bool> streaming_{false};
      std::atomic<bool> save_requested_{false};

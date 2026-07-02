@@ -183,8 +183,16 @@ void PCNode::handle_rsp(const protocol::DynamicFrame &frame, uint64_t receive_ti
         std::cout << "TIME_SYNC: T1=" << T1 << " T2=" << T2 << " T3=" << T3 << " T4=" << T4
                   << " delay=" << delay << " offset=" << offset << "\n";
 
+        last_time_sync_.t1 = T1;
+        last_time_sync_.t2 = T2;
+        last_time_sync_.t3 = T3;
+        last_time_sync_.t4 = T4;
+        ++last_time_sync_.count;
+
         // Send TIME_ADJUST with negative offset
-        send_time_adjust(-offset, T4);
+        if (auto_time_adjust_) {
+            send_time_adjust(-offset, T4);
+        }
     }
 }
 

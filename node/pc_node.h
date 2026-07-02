@@ -13,6 +13,17 @@ namespace node {
 
 class PCNode {
 public:
+    // Raw timestamps from the last completed TIME_SYNC exchange, exposed so
+    // tests can evaluate alternative offset-selection policies against the
+    // same measurement the built-in handler saw.
+    struct TimeSyncMeasurement {
+        uint64_t t1 = 0;     // PC send time (echoed by device)
+        uint64_t t2 = 0;     // Device receive time (device Unix domain)
+        uint64_t t3 = 0;     // Device send time (device Unix domain)
+        uint64_t t4 = 0;     // PC receive time
+        uint64_t count = 0;  // Number of completed exchanges so far
+    };
+
     explicit PCNode(sim::VirtualLinkEndpoint *endpoint);
 
     void tick(uint64_t now_us);
@@ -42,6 +53,11 @@ public:
     uint32_t current_lsb_nA() const { return current_lsb_nA_; }
     uint16_t stream_period_us_cfg() const { return stream_period_us_; }
     uint16_t stream_mask_cfg() const { return stream_mask_; }
+
+    // When disabled, TIME_SYNC responses are recorded in last_time_sync() but
+    // no TIME_ADJUST is sent, letting tests apply their own offset policy.
+    void set_auto_time_adjust(bool enabled) { auto_time_adjust_ = enabled; }
+    const TimeSyncMeasurement &last_time_sync() const { return last_time_sync_; }
 
 private:
     // Tracks an outstanding command awaiting RSP, used for timeout/retransmit logic.
@@ -78,6 +94,8 @@ private:
     uint64_t truncated_data_count_ = 0;
     uint64_t rx_counts_[256] = {};
     uint64_t time_sync_T1_ = 0;  // T1 timestamp for TIME_SYNC calculation
+    bool auto_time_adjust_ = true;       // Send TIME_ADJUST automatically on TIME_SYNC RSP
+    TimeSyncMeasurement last_time_sync_; // Timestamps of the last completed exchange
     uint64_t current_time_us_ = 0;  // Current time updated in tick()
     uint64_t last_timestamp_us_ = 0;  // Last parsed DATA_SAMPLE timestamp_us
 

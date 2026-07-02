@@ -23,6 +23,10 @@ PC only — no `DeviceNode`. PC→device direction has `drop_prob = 1.0`, so com
 
 PC only — no `DeviceNode`. Clean link in both directions. Provides an `InjectFrame()` helper to inject crafted frames from device→PC direction. Used to test orphan RSP and error RSP detection without interference from a real device.
 
+### `TimeSyncClockErrorTest`
+
+Full PC + Device pair over a deterministic link: fixed symmetric 500 µs delay, whole-frame chunks, no drops or bit flips. Injects a device clock error via `TIME_SET` (PC send-time plus an error term) and observes it through `DeviceNode::epoch_offset_us()` — 0 means the device Unix clock matches the simulation clock. `DeviceNode` reports `T2`/`T3` in the device Unix domain (`now + epoch_offset`), matching the firmware, so `TIME_ADJUST` corrections are observable in later exchanges. Helpers: `InjectClockError()`, `RunSyncRound()` (returns the `T1..T4` measurement via `PCNode::last_time_sync()`); `PCNode::set_auto_time_adjust(false)` lets a test apply its own offset policy.
+
 ---
 
 ## Test Cases
@@ -69,6 +73,22 @@ Sends `TIME_SYNC`, waits for RSP and the automatic `TIME_ADJUST` it triggers.
 Then sends `TIME_SET`.
 
 **Asserts**: no timeouts or CRC errors; `rx_count(TIME_SYNC) = 1`, `rx_count(TIME_ADJUST) = 1`, `rx_count(TIME_SET) = 1`.
+
+---
+
+### Time-sync clock-error tests (`TimeSyncClockErrorTest`)
+
+#### `SpecOffsetFormulaConvergesDeviceClock`
+Injects a ~100 ms device clock error, then runs 3 `TIME_SYNC` rounds with `PCNode`'s automatic `TIME_ADJUST` (spec formula per `docs/protocol/uart_protocol.md` §5.2: `offset = ((T2-T1)+(T3-T4))/2`, payload = `-offset`).
+
+**Asserts**: residual `|epoch_offset_us| ≤ 50` — the spec formula drives the device clock error to ~0.
+
+---
+
+#### `PcClientOffsetPolicyDivergesDeviceClock`
+Regression demonstration of the pc_client time-sync sign bug. Disables automatic `TIME_ADJUST`, injects a small clock error, then replays pc_client's exact offset policy (a verbatim replica of `choose_offset()` from `pc_client/src/power_monitor_session.cpp` plus the `-min_element(offsets)` payload from `run_time_sync_rounds()`) over 3 adjust cycles of 3 sync rounds each.
+
+**Asserts**: the clock error grows by ≥ 1.5× on every adjust cycle and ends ≥ 4× the initial error — the policy moves the device clock *away* from the host instead of converging. Once pc_client is fixed to send the spec offset, this test should be inverted into a convergence check.
 
 ---
 
