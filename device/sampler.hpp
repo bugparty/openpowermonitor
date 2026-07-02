@@ -147,11 +147,21 @@ static void sampler_do_work_dma(SamplerContext *ctx) {
 
   DEBUG_DMA_PRINT("[DMA] waiting for RX...\n");
 
-  // 3. Wait for RX to complete (blocking for now, to ensure safety)
-  dma_channel_wait_for_finish_blocking(ctx->dma_rx_chan);
-
-  // We rely on the RX DMA channel finishing to know the PIO transaction
-  // is effectively completed (all bytes received).
+  // 3. Wait for RX to complete, with a timeout. This must NOT block
+  // unboundedly: on an unexpected NACK the PIO program parks itself at
+  // 'irq wait' (i2c.pio do_nack) and stops autopushing, so the RX DMA
+  // never reaches its 50-word count. An unbounded wait here deadlocks
+  // Core 1, and once the 8-entry multicore FIFO fills with unserviced
+  // start/stop commands, multicore_fifo_push_blocking wedges Core 0 too.
+  // Same bounded-poll + abort + resume pattern as __read_one_dma below.
+  uint32_t wait_start = time_us_32();
+  bool timed_out = false;
+  while (dma_channel_is_busy(ctx->dma_rx_chan)) {
+    if (time_us_32() - wait_start > 10000) { // 10ms timeout
+      timed_out = true;
+      break;
+    }
+  }
 
 #ifdef POWERMONITOR_DEBUG_DMA
   DEBUG_DMA_PRINT("[DMA] RX done\n");
@@ -163,10 +173,24 @@ static void sampler_do_work_dma(SamplerContext *ctx) {
   DEBUG_DMA_PRINT("\n");
 #endif
   // Check if any errors occurred on the PIO side (NACK, timeout)
-  bool ok = !pio_i2c_check_error(ctx->pio, ctx->sm);
+  bool ok = !timed_out && !pio_i2c_check_error(ctx->pio, ctx->sm);
+
+  if (timed_out) {
+    // Stop the DMA channels first, then hard-reset the SM: resume clears
+    // the PIO FIFOs, which must not happen while DMA is still armed.
+    dma_channel_abort(ctx->dma_rx_chan);
+    dma_channel_abort(ctx->dma_tx_chan);
+  }
   if (!ok) {
     DEBUG_DMA_PRINT("[DMA] PIO error detected, resuming\n");
     pio_i2c_resume_after_error(ctx->pio, ctx->sm);
+  }
+  if (timed_out) {
+    // rx_buf is incomplete — do not parse or push a sample. The SM has
+    // been reset above, so the next tick starts a clean transaction.
+    shared->samples_dropped++;
+    shared->i2c_error = true;
+    return;
   }
 
   // 4. Parse the RX buffer
