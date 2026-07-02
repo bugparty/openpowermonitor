@@ -208,23 +208,20 @@ protected:
 };
 
 // Verbatim replica of pc_client's offset policy
-// (pc_client/src/power_monitor_session.cpp: choose_offset(), plus
-// run_time_sync_rounds() which applies -min_element(offsets)).
-// Kept in sync by citation, not by linkage: the original lives in an
-// anonymous namespace inside the pc_client binary.
+// (pc_client/src/power_monitor_session.cpp: choose_offset() computes the
+// device-minus-host NTP offset, run_time_sync_rounds() applies the negated
+// median across rounds). Kept in sync by citation, not by linkage: the
+// original lives in an anonymous namespace inside the pc_client binary.
 namespace pc_client_policy {
 
-constexpr int64_t kAsymmetryThresholdUs = 2000;
-
 int64_t choose_offset(int64_t T1, int64_t T2, int64_t T3, int64_t T4) {
-    int64_t forward = T1 - T2;
-    int64_t reverse = T3 - T4;
-    int64_t offset_ntp = ((T1 - T2) + (T4 - T3)) / 2;
-    int64_t asym = llabs(forward - reverse);
-    if (asym > kAsymmetryThresholdUs) {
-        return forward;
-    }
-    return offset_ntp;
+    return ((T2 - T1) + (T3 - T4)) / 2;
+}
+
+int64_t median_offset(std::vector<int64_t> offsets) {
+    const size_t mid = offsets.size() / 2;
+    std::nth_element(offsets.begin(), offsets.begin() + mid, offsets.end());
+    return offsets[mid];
 }
 
 } // namespace pc_client_policy
@@ -249,15 +246,14 @@ TEST_F(TimeSyncClockErrorTest, SpecOffsetFormulaConvergesDeviceClock) {
     EXPECT_EQ(pc->crc_fail_count(), 0);
 }
 
-// Regression demonstration for the pc_client time-sync sign bug:
-// power_monitor_session.cpp computes choose_offset() in the host-minus-device
-// convention (T1-T2 based) but still negates it when building the
-// TIME_ADJUST payload, so the applied correction has the wrong sign and the
-// device clock error roughly DOUBLES on every adjust cycle instead of
-// converging. This test replays that exact policy over the simulated link
-// and asserts the divergence. Once pc_client is fixed to send the spec
-// offset, this test should be inverted into a convergence check.
-TEST_F(TimeSyncClockErrorTest, PcClientOffsetPolicyDivergesDeviceClock) {
+// Regression test for the pc_client time-sync sign bug (fixed 2026-07-01):
+// choose_offset() used to compute the host-minus-device convention while the
+// TIME_ADJUST payload still negated it, so the applied correction had the
+// wrong sign and the device clock error DOUBLED on every adjust cycle. This
+// test replays pc_client's exact (corrected) policy over the simulated link
+// and asserts an injected clock error converges to ~0 — if the sign ever
+// flips back, the error doubles instead and this test fails loudly.
+TEST_F(TimeSyncClockErrorTest, PcClientOffsetPolicyConvergesDeviceClock) {
     pc->set_auto_time_adjust(false);
 
     InjectClockError(1'300);
@@ -265,9 +261,8 @@ TEST_F(TimeSyncClockErrorTest, PcClientOffsetPolicyDivergesDeviceClock) {
     ASSERT_GT(initial_error, 500) << "Clock error injection failed";
 
     constexpr int kPeriodicSyncRounds = 3;  // Matches pc_client
-    constexpr int kAdjustCycles = 3;
+    constexpr int kAdjustCycles = 2;
 
-    int64_t previous_error = initial_error;
     for (int cycle = 0; cycle < kAdjustCycles; ++cycle) {
         std::vector<int64_t> offsets;
         for (int round = 0; round < kPeriodicSyncRounds; ++round) {
@@ -276,21 +271,14 @@ TEST_F(TimeSyncClockErrorTest, PcClientOffsetPolicyDivergesDeviceClock) {
                 static_cast<int64_t>(m.t1), static_cast<int64_t>(m.t2),
                 static_cast<int64_t>(m.t3), static_cast<int64_t>(m.t4)));
         }
-        // pc_client applies the minimum offset of the batch, negated.
-        const int64_t min_offset = *std::min_element(offsets.begin(), offsets.end());
-        pc->send_time_adjust(-min_offset, loop.now_us());
+        // pc_client applies the median offset of the batch, negated.
+        pc->send_time_adjust(-pc_client_policy::median_offset(offsets), loop.now_us());
         RunSimulation(20'000, 100);
-
-        const int64_t error = device->epoch_offset_us();
-        EXPECT_GE(llabs(error), (llabs(previous_error) * 3) / 2)
-            << "Cycle " << cycle << ": pc_client policy unexpectedly reduced the "
-            << "clock error - has the sign bug been fixed? If so, invert this test.";
-        previous_error = error;
     }
 
-    EXPECT_GE(llabs(previous_error), 4 * initial_error)
-        << "pc_client offset policy (choose_offset + '-min_offset') should move "
-        << "the device clock AWAY from the host, doubling the error each cycle";
+    EXPECT_LE(llabs(device->epoch_offset_us()), 50)
+        << "pc_client offset policy (choose_offset + '-median') must converge "
+        << "the device clock to the host, not move it away";
     EXPECT_EQ(pc->timeout_count(), 0);
     EXPECT_EQ(pc->crc_fail_count(), 0);
 }

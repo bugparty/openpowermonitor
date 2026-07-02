@@ -85,10 +85,10 @@ Injects a ~100 ms device clock error, then runs 3 `TIME_SYNC` rounds with `PCNod
 
 ---
 
-#### `PcClientOffsetPolicyDivergesDeviceClock`
-Regression demonstration of the pc_client time-sync sign bug. Disables automatic `TIME_ADJUST`, injects a small clock error, then replays pc_client's exact offset policy (a verbatim replica of `choose_offset()` from `pc_client/src/power_monitor_session.cpp` plus the `-min_element(offsets)` payload from `run_time_sync_rounds()`) over 3 adjust cycles of 3 sync rounds each.
+#### `PcClientOffsetPolicyConvergesDeviceClock`
+Regression test for the pc_client time-sync sign bug (fixed 2026-07-01, previously named `PcClientOffsetPolicyDivergesDeviceClock`). Disables automatic `TIME_ADJUST`, injects a small clock error, then replays pc_client's exact offset policy (a verbatim replica of `choose_offset()` from `pc_client/src/power_monitor_session.cpp` plus the negated-median payload from `run_time_sync_rounds()`) over 2 adjust cycles of 3 sync rounds each.
 
-**Asserts**: the clock error grows by ≥ 1.5× on every adjust cycle and ends ≥ 4× the initial error — the policy moves the device clock *away* from the host instead of converging. Once pc_client is fixed to send the spec offset, this test should be inverted into a convergence check.
+**Asserts**: residual `|epoch_offset_us| ≤ 50` — the policy converges the device clock to the host. If the sign inversion ever regresses, the error doubles per cycle instead and this test fails.
 
 ---
 

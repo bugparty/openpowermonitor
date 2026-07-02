@@ -79,7 +79,6 @@ constexpr int kInitialSyncRounds = 10;
 constexpr int kPeriodicSyncRounds = 3;
 constexpr int64_t kMaxOffsetAfterInitUs = 1000;   // Reject |offset| > 1000 us after init
 constexpr uint64_t kInitPeriodUs = 30000000ULL;    // 30 seconds from sync start before applying filter
-constexpr int64_t kAsymmetryThresholdUs = 2000;    // Asymmetry threshold — tune per link
 
 uint64_t now_steady_us() {
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -101,18 +100,30 @@ int64_t signed_diff_u64(uint64_t a, uint64_t b) {
     return -static_cast<int64_t>(b - a);
 }
 
+// NTP-style clock offset in the protocol's device-minus-host convention
+// (docs/protocol/uart_protocol.md §5.2.1): positive = device clock ahead of
+// host. TIME_ADJUST must carry the NEGATED offset so the device's
+// `epoch_offset_us += payload` cancels the error.
+//
+// NOTE(2026-07-01): this previously computed the host-minus-device
+// convention and was then negated again when building TIME_ADJUST, so every
+// applied correction moved the device clock AWAY from the host and the
+// error doubled per sync cycle (see pc_sim TimeSyncClockErrorTest). The old
+// "asymmetry" branch compared |forward - reverse|, which is identically
+// |2 * offset| and carries no path-delay information, so it misclassified
+// any offset > 1 ms as an asymmetric link; it was removed.
 int64_t choose_offset(int64_t T1, int64_t T2, int64_t T3, int64_t T4) {
-    int64_t forward = T1 - T2;
-    int64_t reverse = T3 - T4;
-    int64_t offset_ntp = ((T1 - T2) + (T4 - T3)) / 2;
-    int64_t asym = llabs(forward - reverse);
+    return ((T2 - T1) + (T3 - T4)) / 2;
+}
 
-    // Asymmetry threshold — tune per link; 2000us is a good starting point
-    if (asym > kAsymmetryThresholdUs) {
-        return forward;    // Asymmetric link: fall back to forward-path-only offset
-    } else {
-        return offset_ntp; // Symmetric link: use full NTP offset
-    }
+// Median offset across sync rounds. Per-round noise is +/-(delay
+// asymmetry)/2 and roughly symmetric around the true offset, so the median
+// is robust to jitter outliers; a signed minimum would systematically pick
+// the most negative noise excursion.
+int64_t median_offset(std::vector<int64_t> offsets) {
+    const size_t mid = offsets.size() / 2;
+    std::nth_element(offsets.begin(), offsets.begin() + mid, offsets.end());
+    return offsets[mid];
 }
 
 // Scrollable log area: focusable component with scroll_y in [0,1]. Uses
@@ -744,19 +755,19 @@ bool PowerMonitorSession::run_time_sync_rounds(int rounds) {
         emit_time_sync_debug(detail);
     }
 
-    // Apply minimum offset (best result) unless disabled by --no-apply-time-offset
+    // Apply the median offset across rounds unless disabled by --no-apply-time-offset
     if (!options_.no_apply_time_offset && !offsets.empty()) {
-        int64_t min_offset = *std::min_element(offsets.begin(), offsets.end());
+        const int64_t offset = median_offset(offsets);
         std::vector<uint8_t> adjust_payload;
-        protocol::append_i64(adjust_payload, -min_offset);
+        protocol::append_i64(adjust_payload, -offset);
         if (send_command_with_retry(protocol::MsgId::kTimeAdjust, adjust_payload, nullptr, false)) {
-            append_log("Applied min offset: " + std::to_string(min_offset) + "us");
-            emit_time_sync_debug("Applied min offset: " + std::to_string(min_offset) + "us");
+            append_log("Applied median offset: " + std::to_string(offset) + "us");
+            emit_time_sync_debug("Applied median offset: " + std::to_string(offset) + "us");
         }
     } else if (options_.no_apply_time_offset && !offsets.empty()) {
-        int64_t min_offset = *std::min_element(offsets.begin(), offsets.end());
-        append_log("Time sync offset (not applied): min=" + std::to_string(min_offset) + "us (--no-apply-time-offset)");
-        emit_time_sync_debug("Time sync offset (not applied): min=" + std::to_string(min_offset) + "us (--no-apply-time-offset)");
+        const int64_t offset = median_offset(offsets);
+        append_log("Time sync offset (not applied): median=" + std::to_string(offset) + "us (--no-apply-time-offset)");
+        emit_time_sync_debug("Time sync offset (not applied): median=" + std::to_string(offset) + "us (--no-apply-time-offset)");
     }
     if (options_.debug_time_sync) {
         debug_time_sync_samples_remaining_.store(8, std::memory_order_relaxed);

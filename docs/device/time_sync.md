@@ -50,9 +50,8 @@ After TIME_SET, the NTP-style TIME_SYNC works correctly if PC also uses Unix tim
 2. **Device** responds with T2, T3 (both are Unix time = monotonic + epoch_offset)
 3. **PC** calculates using Unix time algorithm:
    - delay = (T4 - T1) - (T3 - T2)
-   - forward_offset = T1 - T2  (host→device path only)
-   - ntp_offset = (T2 - T1 + T3 - T4) / 2  (symmetric NTP)
-   - **offset = `choose_offset(T1,T2,T3,T4)`** — see [Asymmetry-Aware Offset Selection](#asymmetry-aware-offset-selection) below
+   - offset = (T2 - T1 + T3 - T4) / 2  (symmetric NTP, device-minus-host: positive = device ahead)
+   - see [Offset Selection](#offset-selection) below for how multiple rounds are combined
 4. **PC** sends `TIME_ADJUST(-offset)` to correct drift
 
 ```
@@ -106,28 +105,26 @@ sequenceDiagram
     Note over S: Adjust clock offset
 ```
 
-## Asymmetry-Aware Offset Selection
-
-USB serial links can be asymmetric: the host→device path delay may differ significantly from the device→host path. Standard NTP averages both paths, which introduces error when they are unequal.
+## Offset Selection
 
 The PC implements `choose_offset(T1, T2, T3, T4)` in `pc_client/src/power_monitor_session.cpp`:
 
 ```
-forward_offset = T1 - T2          // host→device path only
-ntp_offset     = (T2-T1 + T3-T4) / 2  // standard NTP average
-asymmetry      = |forward_offset - reverse_offset|
-                 where reverse_offset = T3 - T4
-
-if asymmetry > kAsymmetryThresholdUs (2000 µs):
-    use forward_offset   // asymmetric link: trust only host→device
-else:
-    use ntp_offset       // symmetric link: use full NTP average
+offset = (T2-T1 + T3-T4) / 2   // standard NTP average, device-minus-host
 ```
 
-**Rationale:**
-- When `|forward - reverse| > 2000 µs`, the return path is clearly delayed (e.g. by device processing, USB scheduling) and averaging it in would bias the result.
-- Falling back to `forward_offset` (T1 - T2) keeps the estimate conservative: it only relies on the host-to-device direction where jitter is lower.
-- The threshold `kAsymmetryThresholdUs = 2000` is tunable per link in the source.
+The convention is device-minus-host: a positive offset means the device clock is ahead, and `TIME_ADJUST(-offset)` is sent so the device's `epoch_offset_us += payload` cancels the error.
+
+Across a batch of sync rounds (10 initial, 3 periodic), the PC applies the **median** of the per-round offsets (`median_offset()`). Per-round noise is ±(path-delay asymmetry)/2, roughly symmetric around the true offset, so the median is robust to jitter outliers; a signed minimum would systematically pick the most negative excursion.
+
+> **History (2026-07-01):** earlier revisions computed the offset in the
+> host-minus-device convention while still negating the TIME_ADJUST payload,
+> so every applied correction moved the device clock *away* from the host and
+> the error doubled per sync cycle. They also had an "asymmetry-aware"
+> fallback comparing `|forward - reverse|` — which is identically
+> `|2 × offset|` and carries no path-delay information, so any offset over
+> 1 ms was misclassified as an asymmetric link. Both were removed; the
+> regression is covered by `pc_sim` `TimeSyncClockErrorTest`.
 
 ## Special Commands
 
