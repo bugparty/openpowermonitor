@@ -32,6 +32,7 @@ constexpr uint8_t kMsgStreamStop = 0x31;
 constexpr uint8_t kMsgDataSample = 0x80;
 constexpr uint8_t kMsgCfgReport = 0x91;
 constexpr uint8_t kMsgTextReport = 0x93;
+constexpr uint8_t kMsgTimeSyncRequest = 0x94;
 
 struct TestOptions {
     std::string port;
@@ -574,6 +575,110 @@ TEST_F(DeviceSerialTest, Order12_StreamLongRunSoak) {
     RecordProperty("drops", static_cast<int>(drops));
     ASSERT_GT(samples, 1000u);
     ASSERT_TRUE(StopStream());
+}
+
+// ---------------------------------------------------------------------------
+// Stress: STREAM_START/STOP wedge hunt (DISABLED_ — run explicitly)
+// ---------------------------------------------------------------------------
+// Field report (2026-07-01): repeatedly toggling stream start/stop in the
+// TUI once killed the sample flow permanently ("Flush failed" on the host);
+// only a full power cycle — which also power-cycles the separately-supplied
+// INA228 — recovered it, and it has not reproduced since. This test
+// automates the hunt with two attack phases and pinpointed health checks so
+// a recurrence yields a diagnosis (command path dead vs sampler dead)
+// instead of a dead board.
+//
+// Deliberately destructive in intent, so it is DISABLED_ and excluded from
+// the ordered suite. Run it explicitly:
+//   pc_client_tests --port /dev/ttyACMx \
+//     --gtest_also_run_disabled_tests --gtest_filter='*WedgeHunt*'
+//
+// Determinism: dwell/gap sweeps use fixed multiplicative sequences, not
+// randomness, per the repo rule on deterministic test seeds.
+TEST_F(DeviceSerialTest, DISABLED_Stress_StreamStartStopWedgeHunt) {
+    SetRisky(true);
+
+    constexpr int kRapidCycles = 100;
+    constexpr int kSyncRaceCycles = 12;
+    constexpr int kHealthCheckEvery = 10;
+
+    // Distinguishes "whole device dead" (PING fails -> Core 0 wedged, e.g.
+    // multicore FIFO saturation) from "sampler dead" (PING ok but no
+    // samples -> Core 1 / PIO / INA228 path, e.g. stuck bus).
+    auto require_alive = [&](const char *phase, int cycle) {
+        ASSERT_TRUE(SendCommand(kMsgPing, {}))
+            << phase << " cycle " << cycle
+            << ": PING dead — Core 0 wedged (command path unresponsive)";
+    };
+
+    // ---- Phase A: rapid toggling ----
+    // Dwell 40..160 ms, gap 0..49 ms, both swept deterministically.
+    int zero_sample_streak = 0;
+    for (int i = 0; i < kRapidCycles; ++i) {
+        ASSERT_TRUE(StartStream())
+            << "Phase A cycle " << i << ": STREAM_START not acknowledged";
+        const int dwell_ms = 40 + (i * 13) % 120;
+        size_t received = 0;
+        WaitForSamples(1, std::chrono::milliseconds(dwell_ms), &received);
+        if (received == 0 && dwell_ms >= 100) {
+            ++zero_sample_streak;
+            ASSERT_LT(zero_sample_streak, 3)
+                << "Phase A cycle " << i << ": 3 consecutive cycles with zero "
+                << "samples while commands still work — sampler/INA228 path "
+                << "dead (stuck-bus signature). Do NOT power cycle; capture "
+                << "STATS_REPORT drop counters first.";
+        } else if (received > 0) {
+            zero_sample_streak = 0;
+        }
+        ASSERT_TRUE(StopStream())
+            << "Phase A cycle " << i << ": STREAM_STOP not acknowledged";
+        std::this_thread::sleep_for(std::chrono::milliseconds((i * 7) % 50));
+        if (i % kHealthCheckEvery == kHealthCheckEvery - 1) {
+            require_alive("Phase A", i);
+            DrainInput();
+        }
+    }
+    DrainInput();
+
+    // ---- Phase B: toggle burst inside the sync_waiting window ----
+    // EVT_TIME_SYNC_REQUEST fires on WALL time (time_us_64), evaluated only
+    // while streaming: immediately on the first streaming iteration after
+    // boot, then every kTimeSyncRequestPeriodUs = 120 s. After it fires the
+    // device sits in a tight sync_waiting loop for up to 200 ms waiting for
+    // TIME_ADJUST. This harness never answers, streams until the EVT
+    // arrives (<= one full period), then hammers STOP/START inside the
+    // window — the race a TUI user hits pressing 't' right after starting
+    // a stream that followed a >2 min idle gap.
+    ASSERT_TRUE(StartStream()) << "Phase B: STREAM_START not acknowledged";
+    protocol::DynamicFrame evt;
+    const bool got_evt = WaitForEvent(kMsgTimeSyncRequest, &evt, 125000);
+    RecordProperty("sync_race_evt_hit", got_evt ? 1 : 0);
+    EXPECT_TRUE(got_evt)
+        << "Phase B never observed EVT_TIME_SYNC_REQUEST within a full "
+        << "period — check kTimeSyncRequestPeriodUs/streaming state";
+    for (int k = 0; k < kSyncRaceCycles; ++k) {
+        ASSERT_TRUE(StopStream())
+            << "Phase B burst " << k << ": STREAM_STOP not acknowledged"
+            << (got_evt && k == 0 ? " (inside sync_waiting window)" : "");
+        std::this_thread::sleep_for(std::chrono::milliseconds((k * 23) % 60));
+        ASSERT_TRUE(StartStream())
+            << "Phase B burst " << k << ": STREAM_START not acknowledged";
+    }
+    ASSERT_TRUE(StopStream()) << "Phase B: final STREAM_STOP not acknowledged";
+    require_alive("Phase B", kSyncRaceCycles);
+    DrainInput();
+
+    // ---- Final: full functional check ----
+    // Commands alive AND the sampler actually produces data at rate.
+    require_alive("Final", 0);
+    ASSERT_TRUE(StartStream());
+    ASSERT_TRUE(WaitForSamples(100, std::chrono::milliseconds(2000)))
+        << "Final check: sampler did not deliver 100 samples in 2 s after "
+        << "the stress — sample path degraded even though commands work";
+    ASSERT_TRUE(StopStream());
+    DrainInput();
+    ASSERT_TRUE(WaitForNoSamples(std::chrono::milliseconds(1000)))
+        << "Final check: device kept streaming after STREAM_STOP";
 }
 
 }  // namespace

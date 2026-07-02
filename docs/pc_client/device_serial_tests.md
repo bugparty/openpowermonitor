@@ -82,6 +82,21 @@ A design for gtest-based on-device functional tests that reuse `pc_client` facil
 - Tests implement the ordered list above with abort-on-risk behavior.
 - Documentation here kept in sync with test code per `docs/naming_convention.md`.
 
+## Stress Test: STREAM_START/STOP Wedge Hunt
+
+`DISABLED_Stress_StreamStartStopWedgeHunt` automates the hunt for a field-reported wedge (2026-07-01: rapid TUI stream toggling killed the sample flow until a full power cycle; not reproduced since). It is `DISABLED_` and excluded from the ordered suite — run explicitly:
+
+```bash
+pc_client_tests --port /dev/ttyACMx --gtest_also_run_disabled_tests --gtest_filter='*WedgeHunt*'
+```
+
+Structure (~2 minutes, deterministic sweeps, no randomness):
+- **Phase A** — 100 rapid start/stop cycles (dwell 40–160 ms, gap 0–49 ms), sample-flow check per cycle, PING health check every 10 cycles. Three consecutive zero-sample cycles with live commands fails with a "sampler/INA228 dead" diagnosis.
+- **Phase B** — streams until `EVT_TIME_SYNC_REQUEST` arrives (fires on wall time: immediately on the first stream after boot, then every 120 s), never answers `TIME_ADJUST`, and hammers a 12× STOP/START burst inside the device's 200 ms `sync_waiting` window — the race a TUI user hits pressing `t` right after starting a stream that followed a >2 min idle gap. This phase can wait up to ~2 min for the EVT.
+- **Final** — PING + 100 samples in 2 s + stop-silence check, distinguishing "Core 0 wedged" from "sampler dead" in every failure message.
+
+If it fails: do **not** power cycle (that also resets the separately-powered INA228 and destroys the evidence). Capture PING state and `STATS_REPORT` drop counters first.
+
 ## Hardware-Free Session Shutdown E2E Test
 
 Separate from the on-device tests above, `pc_client/tests/session_shutdown_tests.cpp`
