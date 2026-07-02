@@ -343,42 +343,60 @@ private:
         const auto* cmd = reinterpret_cast<const protocol::RegReadCmdPayload*>(frame.data);
         auto reg_addr = static_cast<INA228::INA228_Register>(cmd->reg_addr);
 
-        if (!ctx_.ina228) {
+        size_t value_len = 0;
+        if (cmd->reg_type == 0) {
+            value_len = 2;
+        } else if (cmd->reg_type == 1) {
+            value_len = 3;
+        } else if (cmd->reg_type == 2) {
+            value_len = 5;
+        } else {
+            send_rsp(frame.seq, frame.msgid, protocol::Status::kErrParam);
+            return;
+        }
+
+        // While streaming, Core 1 owns the I2C bus (PIO DMA sampling); a
+        // second master here would corrupt its transactions. timer_active
+        // additionally covers the brief window after STREAM_STOP while the
+        // async stop command is still in flight to Core 1 (best-effort
+        // cross-core read; benign race).
+        if (ctx_.is_streaming() || g_sampler_ctx.timer_active) {
             send_rsp(frame.seq, frame.msgid, protocol::Status::kErrHw);
             return;
         }
 
-        uint8_t rsp_buf[10]; // Space for header + 40-bit value
-        size_t value_len = 0;
+        uint8_t raw[5] = {0}; // Register bytes, MSB first (INA228 wire order)
         bool ok = false;
-
-        if (cmd->reg_type == 0) { // 16-bit
-            value_len = 2;
-            uint16_t val;
-            ok = ctx_.ina228->read_register16(reg_addr, val);
-            if (ok) {
-                val = INA228::to_bytes16(val); // to little-endian
-                memcpy(&rsp_buf[3], &val, value_len);
+        if (g_sampler_ctx.pio != nullptr) {
+            // Normal build: boot handed the bus from hardware I2C to PIO
+            // (powermonitor.cpp i2c_deinit), so the INA228 driver's blocking
+            // hardware-I2C calls would spin forever. Use the PIO CPU path,
+            // which has internal timeouts and self-recovers after errors.
+            ok = pio_i2c_read_reg(g_sampler_ctx.pio, g_sampler_ctx.sm,
+                                  g_sampler_ctx.i2c_addr, cmd->reg_addr,
+                                  raw, value_len);
+        } else if (ctx_.ina228) {
+            // TEST_MODE build: hardware I2C is still initialized.
+            if (cmd->reg_type == 0) {
+                uint16_t val = 0;
+                ok = ctx_.ina228->read_register16(reg_addr, val);
+                raw[0] = static_cast<uint8_t>(val >> 8);
+                raw[1] = static_cast<uint8_t>(val);
+            } else if (cmd->reg_type == 1) {
+                uint32_t val = 0;
+                ok = ctx_.ina228->read_register24(reg_addr, val);
+                raw[0] = static_cast<uint8_t>(val >> 16);
+                raw[1] = static_cast<uint8_t>(val >> 8);
+                raw[2] = static_cast<uint8_t>(val);
+            } else {
+                uint64_t val = 0;
+                ok = ctx_.ina228->read_register40(reg_addr, val);
+                raw[0] = static_cast<uint8_t>(val >> 32);
+                raw[1] = static_cast<uint8_t>(val >> 24);
+                raw[2] = static_cast<uint8_t>(val >> 16);
+                raw[3] = static_cast<uint8_t>(val >> 8);
+                raw[4] = static_cast<uint8_t>(val);
             }
-        } else if (cmd->reg_type == 1) { // 24-bit
-            value_len = 3;
-            uint32_t val;
-            ok = ctx_.ina228->read_register24(reg_addr, val);
-            if (ok) {
-                // val is already little-endian from I2C read
-                memcpy(&rsp_buf[3], &val, value_len);
-            }
-        } else if (cmd->reg_type == 2) { // 40-bit
-            value_len = 5;
-            uint64_t val;
-            ok = ctx_.ina228->read_register40(reg_addr, val);
-            if (ok) {
-                // val is already little-endian from I2C read
-                memcpy(&rsp_buf[3], &val, value_len);
-            }
-        } else {
-            send_rsp(frame.seq, frame.msgid, protocol::Status::kErrParam);
-            return;
         }
 
         if (!ok) {
@@ -387,9 +405,14 @@ private:
         }
 
         // Build and send response frame
+        uint8_t rsp_buf[10]; // Space for header + 40-bit value
         rsp_buf[0] = frame.msgid;
         rsp_buf[1] = static_cast<uint8_t>(protocol::Status::kOk);
         rsp_buf[2] = cmd->reg_addr;
+        // Spec: variable-length register data is little-endian on the wire.
+        for (size_t i = 0; i < value_len; ++i) {
+            rsp_buf[3 + i] = raw[value_len - 1 - i];
+        }
 
         size_t len = protocol::build_frame(
             tx_buf_, sizeof(tx_buf_),
@@ -409,13 +432,32 @@ private:
         }
         const auto* cmd = reinterpret_cast<const protocol::RegWriteCmdPayload*>(frame.data);
 
-        if (!ctx_.ina228) {
+        // Same bus-ownership rule as handle_reg_read.
+        if (ctx_.is_streaming() || g_sampler_ctx.timer_active) {
             send_rsp(frame.seq, frame.msgid, protocol::Status::kErrHw);
             return;
         }
 
-        auto reg_addr = static_cast<INA228::INA228_Register>(cmd->reg_addr);
-        bool ok = ctx_.ina228->write_register16(reg_addr, cmd->reg_value);
+        bool ok = false;
+        if (g_sampler_ctx.pio != nullptr) {
+            // Normal build: hardware I2C is deinitialized at boot; write via
+            // the PIO CPU path (INA228 register write = reg, MSB, LSB).
+            uint8_t tx[3] = {cmd->reg_addr,
+                             static_cast<uint8_t>(cmd->reg_value >> 8),
+                             static_cast<uint8_t>(cmd->reg_value)};
+            ok = pio_i2c_write_blocking(g_sampler_ctx.pio, g_sampler_ctx.sm,
+                                        g_sampler_ctx.i2c_addr, tx, 3,
+                                        /*nostop=*/false) == 0;
+            // pio_i2c_write_blocking disables RX autopush and does not
+            // restore it, but the DMA sampler relies on it staying armed
+            // (enabled once in sampler_init_dma, not per tick). Re-arm it
+            // or the next STREAM_START would produce no samples.
+            pio_i2c_rx_enable(g_sampler_ctx.pio, g_sampler_ctx.sm, true);
+        } else if (ctx_.ina228) {
+            // TEST_MODE build: hardware I2C is still initialized.
+            auto reg_addr = static_cast<INA228::INA228_Register>(cmd->reg_addr);
+            ok = ctx_.ina228->write_register16(reg_addr, cmd->reg_value);
+        }
 
         send_rsp(frame.seq, frame.msgid, ok ? protocol::Status::kOk : protocol::Status::kErrHw);
     }
